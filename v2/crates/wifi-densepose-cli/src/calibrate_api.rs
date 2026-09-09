@@ -415,7 +415,7 @@ async fn ingest_loop(
                         continue;
                     }
                     let tier = params.tier.unwrap_or_else(|| default_tier.clone());
-                    if !["ht20", "ht40", "he20", "he40"].contains(&tier.to_ascii_lowercase().as_str()) {
+                    if !["ht20", "ht40", "esp32_ht40_192", "he20", "he40"].contains(&tier.to_ascii_lowercase().as_str()) {
                         let _ = reply.send(Err(format!("invalid tier {tier:?}")));
                         continue;
                     }

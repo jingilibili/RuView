@@ -600,7 +600,7 @@ void csi_collector_init(void)
     csi_config.enable = 1U;
     csi_config.acquire_csi_legacy = 1U;
     csi_config.acquire_csi_ht20 = 1U;
-    csi_config.acquire_csi_ht40 = 1U;
+    csi_config.acquire_csi_ht40 = 0U;
     csi_config.acquire_csi_su = 1U;
     csi_config.acquire_csi_mu = 1U;
     csi_config.acquire_csi_dcm = 1U;

@@ -133,6 +133,15 @@ impl CalibrationConfig {
     pub fn ht40() -> Self {
         Self { tier: PhyTier::Ht40, num_subcarriers: 128, num_active: 114, min_frames: DEFAULT_MIN_FRAMES, max_phase_variance: 0.3 }
     }
+    /// ESP32 HT40 capture: 192 raw CSI bins.
+    pub fn ht40_192() -> Self {
+        Self { tier: PhyTier::Ht40, num_subcarriers: 192, num_active: 192, min_frames: DEFAULT_MIN_FRAMES, max_phase_variance: 0.3 }
+    }
+
+    /// ESP32 HT40 capture: 128 raw CSI bins.
+    pub fn ht40_128() -> Self {
+        Self { tier: PhyTier::Ht40, num_subcarriers: 128, num_active: 128, min_frames: DEFAULT_MIN_FRAMES, max_phase_variance: 0.3 }
+    }
     /// HE20 defaults: 256 FFT, **256 active** (record all delivered bins).
     ///
     /// Issue #1009: the ESP-IDF v5.5.2 driver delivers all 256 FFT bins on the

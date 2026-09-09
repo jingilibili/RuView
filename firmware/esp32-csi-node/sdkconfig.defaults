@@ -66,3 +66,4 @@ CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
 # Was present in sdkconfig.defaults.template but missing here — fixed
 # in the v0.6.5-esp32 release.
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
+CONFIG_CSI_ENABLE_UDP=y

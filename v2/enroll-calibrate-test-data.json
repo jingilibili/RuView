@@ -1,0 +1,1075 @@
+{
+  "schema": "ruview.enroll-calibrate.test-data",
+  "version": 1,
+  "generated_at_unix_s": 1788938232,
+  "source": {
+    "chat_history_url": "https://chatgpt.com/share/6aa100cd-9e6c-83ed-99a9-a7797f000505",
+    "chat_title": "رفع خطای Cargo",
+    "fork_repo": "github.com/jingilibili/ruview",
+    "upstream_repo": "github.com/ruvnet/ruview"
+  },
+  "test_conditions": {
+    "room": {
+      "physical_room": "roomB",
+      "cli_room_id": "default",
+      "note": "Physical test room is 'roomB'; the enroll CLI --room-id was left at its 'default' value in the captured sessions."
+    },
+    "hardware": {
+      "device": "ESP32-S3 (QFN56, chip revision v0.2)",
+      "firmware": "esp32-csi-node, ESP-IDF v5.4",
+      "node_count": 4,
+      "wifi_ssid": "mehdi",
+      "nodes": {
+        "node1": "10.157.21.149",
+        "node2": "10.157.21.100",
+        "node3": "10.157.21.237",
+        "node4": "10.157.21.169"
+      },
+      "note": "Node IPs were DHCP-assigned and shifted across sessions; Node 3 also appeared at 10.157.21.149 in a later session.",
+      "aggregator": {
+        "windows_pc": "10.157.21.177:5005",
+        "wsl": "172.22.100.172:5005",
+        "note": "ESPs send UDP CSI to the Windows PC; WSL receives via udp_forwarder.py (repo root)."
+      }
+    },
+    "firmware_config": {
+      "acquire_csi_ht40": 0,
+      "acquire_csi_legacy": 1,
+      "acquire_csi_ht20": 1,
+      "acquire_csi_su": 1,
+      "acquire_csi_mu": 1,
+      "acquire_csi_dcm": 1,
+      "CONFIG_CSI_ENABLE_UDP": true,
+      "CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH": 8192,
+      "note": "HT40 acquisition was disabled (1 -> 0) in csi_collector.c; the ESP32-S3 delivers 192 raw HT40 subcarriers on the ht20/legacy path instead."
+    },
+    "csi": {
+      "udp_port": 5005,
+      "fs_hz": 15.0,
+      "tiers": {
+        "esp32_ht40_192": {
+          "num_subcarriers": 192,
+          "num_active": 192,
+          "packet_bytes": 404
+        },
+        "esp32_ht40_128": {
+          "num_subcarriers": 128,
+          "num_active": 128,
+          "packet_bytes": 276
+        },
+        "ht40": {
+          "num_subcarriers": 128,
+          "num_active": 114
+        }
+      },
+      "note": "esp32_ht40_192 / esp32_ht40_128 are new tiers added locally (calibration.rs ht40_192()/ht40_128())."
+    },
+    "protocol": {
+      "calibrate": "empty-room baseline capture (default 30 s; roomB all-nodes run used ~120 s).",
+      "enroll": "guided 8-anchor sequence (~4 min), quality-gated with re-prompt.",
+      "train_room": "train per-room specialist bank from an enrollment (ADR-151 Stage 4).",
+      "anchor_sequence": [
+        "empty",
+        "stand_still",
+        "sit",
+        "lie_down",
+        "breathe_slow",
+        "breathe_normal",
+        "small_move",
+        "sleep_posture"
+      ],
+      "quality_gates": {
+        "min_presence_z": 1.5,
+        "empty_max_z": 1.0,
+        "min_frames": 60,
+        "small_move_min_motion_rate": 0.3,
+        "still_max_motion_rate": 0.6,
+        "attempts_per_anchor": 2
+      },
+      "signal_constants": {
+        "AMP_STD_FLOOR": 1e-12,
+        "MOTION_AMP_Z_THRESHOLD": 2.0,
+        "MOTION_PHASE_DRIFT_THRESHOLD": "pi/6 (~0.5236)"
+      }
+    }
+  },
+  "calibration": {
+    "all_nodes_roomB": [
+      {
+        "file": "baselines/roomB/baseline-node1.bin",
+        "node_id": 1,
+        "bytes": 3100,
+        "tier_byte": 1,
+        "tier": "Ht40",
+        "frames": 1209,
+        "subcarriers": 192,
+        "amp_mean": {
+          "mean": 15.4037,
+          "median": 13.8236,
+          "min": 0.0,
+          "max": 121.1547
+        },
+        "amp_std": {
+          "mean": 4.5354,
+          "median": 3.5639,
+          "min": 0.0,
+          "max": 12.392
+        },
+        "variance": {
+          "mean": 34.3849,
+          "min": 0.0,
+          "max": 153.5613
+        },
+        "tiny_std_bins": "26/192"
+      },
+      {
+        "file": "baselines/roomB/baseline-node2.bin",
+        "node_id": 2,
+        "bytes": 3100,
+        "tier_byte": 1,
+        "tier": "Ht40",
+        "frames": 3456,
+        "subcarriers": 192,
+        "amp_mean": {
+          "mean": 14.2195,
+          "median": 11.3159,
+          "min": 0.0,
+          "max": 64.9575
+        },
+        "amp_std": {
+          "mean": 1.2534,
+          "median": 0.9789,
+          "min": 0.0,
+          "max": 29.087
+        },
+        "variance": {
+          "mean": 9.966,
+          "min": 0.0,
+          "max": 846.0523
+        },
+        "tiny_std_bins": "26/192"
+      },
+      {
+        "file": "baselines/roomB/baseline-node3.bin",
+        "node_id": 3,
+        "bytes": 3100,
+        "tier_byte": 1,
+        "tier": "Ht40",
+        "frames": 3200,
+        "subcarriers": 192,
+        "amp_mean": {
+          "mean": 14.7237,
+          "median": 12.7634,
+          "min": 0.0,
+          "max": 65.7222
+        },
+        "amp_std": {
+          "mean": 3.879,
+          "median": 3.1138,
+          "min": 0.0,
+          "max": 59.6212
+        },
+        "variance": {
+          "mean": 55.2101,
+          "min": 0.0,
+          "max": 3554.6826
+        },
+        "tiny_std_bins": "26/192"
+      },
+      {
+        "file": "baselines/roomB/baseline-node4.bin",
+        "node_id": 4,
+        "bytes": 3100,
+        "tier_byte": 1,
+        "tier": "Ht40",
+        "frames": 3008,
+        "subcarriers": 192,
+        "amp_mean": {
+          "mean": 14.284,
+          "median": 16.0515,
+          "min": 0.0,
+          "max": 70.8973
+        },
+        "amp_std": {
+          "mean": 1.3139,
+          "median": 1.1246,
+          "min": 0.0,
+          "max": 32.1321
+        },
+        "variance": {
+          "mean": 11.9087,
+          "min": 0.0,
+          "max": 1032.4719
+        },
+        "tiny_std_bins": "26/192"
+      }
+    ],
+    "single_node_baselines": [
+      {
+        "file": "baseline-node3-128.bin",
+        "tier": "esp32_ht40_128",
+        "subcarriers": 128,
+        "baseline_id": "00000000-0000-0000-4217-5733923f7f27"
+      },
+      {
+        "file": "baseline-node3.bin",
+        "tier": "esp32_ht40_192",
+        "subcarriers": 192,
+        "baseline_id": "00000000-0000-0000-a35e-b8db500e75bd"
+      },
+      {
+        "file": "baseline-roomB-node3-192-robust.bin",
+        "tier": "esp32_ht40_192",
+        "subcarriers": 192,
+        "baseline_id": "00000000-0000-0000-f3ca-d7f794feade9"
+      },
+      {
+        "file": "baseline-roomB-node3-192-final.bin",
+        "tier": "esp32_ht40_192",
+        "subcarriers": 192
+      },
+      {
+        "file": "baseline-roomB-node3-192.bin",
+        "tier": "esp32_ht40_192",
+        "subcarriers": 192
+      },
+      {
+        "file": "baseline-roomB-120.bin",
+        "tier": "esp32_ht40_192",
+        "subcarriers": 192
+      },
+      {
+        "file": "baseline-roomB-check.bin",
+        "tier": "esp32_ht40_192",
+        "subcarriers": 192
+      }
+    ]
+  },
+  "enrollment": {
+    "sessions": [
+      {
+        "name": "default (ht40 tier, all nodes)",
+        "output": "v2/enrollment.json",
+        "command": "enroll --udp-port 5005 --bind 0.0.0.0 --baseline ./baseline.bin --tier ht40 --room-id default --output ./enrollment.json --fs-hz 15 --attempts 2",
+        "accepted": "5/8",
+        "data": {
+          "room_id": "default",
+          "baseline_id": "00000000-0000-0000-2142-37101a124f17",
+          "fs_hz": 15.0,
+          "anchors": [
+            {
+              "room_id": "default",
+              "label": "empty",
+              "features": {
+                "mean": 16.418804,
+                "variance": 22.78224,
+                "motion": 4.8739944,
+                "breathing_score": 0.09178654,
+                "breathing_hz": 0.2,
+                "heart_score": 0.08785272,
+                "heart_hz": 3.0
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "stand_still",
+              "features": {
+                "mean": 16.4274,
+                "variance": 19.378036,
+                "motion": 3.3941896,
+                "breathing_score": 0.17609423,
+                "breathing_hz": 0.2238806,
+                "heart_score": 0.19739366,
+                "heart_hz": 1.1538461
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "sit",
+              "features": {
+                "mean": 16.616457,
+                "variance": 22.99614,
+                "motion": 2.9588003,
+                "breathing_score": 0.118619375,
+                "breathing_hz": 0.16483517,
+                "heart_score": 0.19999173,
+                "heart_hz": 2.142857
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "breathe_slow",
+              "features": {
+                "mean": 15.432724,
+                "variance": 11.496117,
+                "motion": 2.143954,
+                "breathing_score": 0.09893887,
+                "breathing_hz": 0.2542373,
+                "heart_score": 0.10292037,
+                "heart_hz": 2.142857
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "breathe_normal",
+              "features": {
+                "mean": 15.324518,
+                "variance": 9.08671,
+                "motion": 1.6146686,
+                "breathing_score": 0.08389339,
+                "breathing_hz": 0.625,
+                "heart_score": 0.1031137,
+                "heart_hz": 2.142857
+              }
+            }
+          ],
+          "session": {
+            "room_id": "default",
+            "baseline_id": "00000000-0000-0000-2142-37101a124f17",
+            "events": [
+              {
+                "Started": {
+                  "room_id": "default",
+                  "baseline_id": "00000000-0000-0000-2142-37101a124f17",
+                  "at": 1788722005
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "empty",
+                    "captured_at_unix_s": 1788722028,
+                    "quality": {
+                      "presence_z": 0.87504107,
+                      "motion_rate": 0.70299727,
+                      "frames": 734,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "stand_still",
+                    "captured_at_unix_s": 1788722051,
+                    "quality": {
+                      "presence_z": 1.5428934,
+                      "motion_rate": 0.47421384,
+                      "frames": 795,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "sit",
+                  "reason": "no person detected (presence_z 1.43 < 1.50) — move closer / face the sensor",
+                  "at": 1788722074
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "sit",
+                    "captured_at_unix_s": 1788722097,
+                    "quality": {
+                      "presence_z": 1.5636714,
+                      "motion_rate": 0.24903722,
+                      "frames": 779,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "lie_down",
+                  "reason": "no person detected (presence_z 1.05 < 1.50) — move closer / face the sensor",
+                  "at": 1788722120
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "lie_down",
+                  "reason": "no person detected (presence_z 0.85 < 1.50) — move closer / face the sensor",
+                  "at": 1788722143
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "breathe_slow",
+                    "captured_at_unix_s": 1788722176,
+                    "quality": {
+                      "presence_z": 1.5411544,
+                      "motion_rate": 0.24837813,
+                      "frames": 1079,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "breathe_normal",
+                  "reason": "no person detected (presence_z 1.00 < 1.50) — move closer / face the sensor",
+                  "at": 1788722209
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "breathe_normal",
+                    "captured_at_unix_s": 1788722242,
+                    "quality": {
+                      "presence_z": 1.6027778,
+                      "motion_rate": 0.19685768,
+                      "frames": 1082,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "small_move",
+                  "reason": "no person detected (presence_z 1.49 < 1.50) — move closer / face the sensor",
+                  "at": 1788722265
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "small_move",
+                  "reason": "no person detected (presence_z 1.39 < 1.50) — move closer / face the sensor",
+                  "at": 1788722288
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "sleep_posture",
+                  "reason": "no person detected (presence_z 1.10 < 1.50) — move closer / face the sensor",
+                  "at": 1788722321
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "sleep_posture",
+                  "reason": "no person detected (presence_z 1.23 < 1.50) — move closer / face the sensor",
+                  "at": 1788722354
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "node3 128-subcarrier (insufficient frames)",
+        "output": "v2/enrollment-node3-128.json",
+        "command": "enroll --node-id 3 --tier esp32_ht40_128 --baseline baseline-node3-128.bin --output enrollment-node3-128.json",
+        "accepted": "0/8",
+        "data": {
+          "room_id": "default",
+          "baseline_id": "00000000-0000-0000-4217-5733923f7f27",
+          "fs_hz": 15.0,
+          "anchors": [],
+          "session": {
+            "room_id": "default",
+            "baseline_id": "00000000-0000-0000-4217-5733923f7f27",
+            "events": [
+              {
+                "Started": {
+                  "room_id": "default",
+                  "baseline_id": "00000000-0000-0000-4217-5733923f7f27",
+                  "at": 1788679015
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "empty",
+                  "reason": "only 4 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679038
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "empty",
+                  "reason": "only 14 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679061
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "stand_still",
+                  "reason": "only 5 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679084
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "stand_still",
+                  "reason": "only 29 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679107
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "sit",
+                  "reason": "only 4 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679130
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "sit",
+                  "reason": "only 3 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679153
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "lie_down",
+                  "reason": "only 2 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679176
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "lie_down",
+                  "reason": "only 5 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679199
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "breathe_slow",
+                  "reason": "only 6 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679232
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "breathe_slow",
+                  "reason": "only 3 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679265
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "breathe_normal",
+                  "reason": "only 6 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679298
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "breathe_normal",
+                  "reason": "only 8 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679331
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "small_move",
+                  "reason": "only 6 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679354
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "small_move",
+                  "reason": "only 5 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679377
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "sleep_posture",
+                  "reason": "only 14 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679410
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "sleep_posture",
+                  "reason": "only 15 frames (need ≥60); is the ESP32 streaming?",
+                  "at": 1788679443
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "node3 192-subcarrier",
+        "output": "v2/enrollment-node3-192.json",
+        "command": "enroll --node-id 3 --tier esp32_ht40_192 --baseline baseline-node3.bin --output enrollment-node3-192.json",
+        "accepted": "6/8",
+        "data": {
+          "room_id": "default",
+          "baseline_id": "00000000-0000-0000-a35e-b8db500e75bd",
+          "fs_hz": 15.0,
+          "anchors": [
+            {
+              "room_id": "default",
+              "label": "stand_still",
+              "features": {
+                "mean": 15.490946,
+                "variance": 13.37086,
+                "motion": 3.1548338,
+                "breathing_score": 0.07719858,
+                "breathing_hz": 0.28846154,
+                "heart_score": 0.10550062,
+                "heart_hz": 0.88235295
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "sit",
+              "features": {
+                "mean": 14.292637,
+                "variance": 5.384011,
+                "motion": 1.4018824,
+                "breathing_score": 0.13112739,
+                "breathing_hz": 0.45454547,
+                "heart_score": 0.08778818,
+                "heart_hz": 1.0
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "lie_down",
+              "features": {
+                "mean": 14.0440645,
+                "variance": 1.7799417,
+                "motion": 0.58805865,
+                "breathing_score": 0.11371446,
+                "breathing_hz": 0.5769231,
+                "heart_score": 0.18654089,
+                "heart_hz": 1.3636364
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "breathe_slow",
+              "features": {
+                "mean": 14.130458,
+                "variance": 3.48159,
+                "motion": 0.96798,
+                "breathing_score": 0.09106275,
+                "breathing_hz": 0.6,
+                "heart_score": 0.050891258,
+                "heart_hz": 0.8333333
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "breathe_normal",
+              "features": {
+                "mean": 14.560489,
+                "variance": 6.772073,
+                "motion": 1.7408038,
+                "breathing_score": 0.116992734,
+                "breathing_hz": 0.5,
+                "heart_score": 0.08081697,
+                "heart_hz": 0.88235295
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "sleep_posture",
+              "features": {
+                "mean": 14.36921,
+                "variance": 5.1124716,
+                "motion": 1.3740678,
+                "breathing_score": 0.06310073,
+                "breathing_hz": 0.14423077,
+                "heart_score": 0.07496105,
+                "heart_hz": 1.0714285
+              }
+            }
+          ],
+          "session": {
+            "room_id": "default",
+            "baseline_id": "00000000-0000-0000-a35e-b8db500e75bd",
+            "events": [
+              {
+                "Started": {
+                  "room_id": "default",
+                  "baseline_id": "00000000-0000-0000-a35e-b8db500e75bd",
+                  "at": 1788683249
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "empty",
+                  "reason": "room not empty (presence_z 2.11 > 1.00) — clear the room",
+                  "at": 1788683272
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "empty",
+                  "reason": "room not empty (presence_z 2.23 > 1.00) — clear the room",
+                  "at": 1788683296
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "stand_still",
+                    "captured_at_unix_s": 1788683319,
+                    "quality": {
+                      "presence_z": 2.1182623,
+                      "motion_rate": 0.3515732,
+                      "frames": 731,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "sit",
+                    "captured_at_unix_s": 1788683342,
+                    "quality": {
+                      "presence_z": 1.7859217,
+                      "motion_rate": 0.13484646,
+                      "frames": 749,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "lie_down",
+                    "captured_at_unix_s": 1788683365,
+                    "quality": {
+                      "presence_z": 1.8027391,
+                      "motion_rate": 0.038666666,
+                      "frames": 750,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "breathe_slow",
+                    "captured_at_unix_s": 1788683398,
+                    "quality": {
+                      "presence_z": 1.9306113,
+                      "motion_rate": 0.09478673,
+                      "frames": 1055,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "breathe_normal",
+                    "captured_at_unix_s": 1788683431,
+                    "quality": {
+                      "presence_z": 2.102434,
+                      "motion_rate": 0.20660378,
+                      "frames": 1060,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "small_move",
+                  "reason": "not enough motion (15% < 30%) — move a bit more",
+                  "at": 1788683454
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "small_move",
+                  "reason": "not enough motion (21% < 30%) — move a bit more",
+                  "at": 1788683477
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "sleep_posture",
+                    "captured_at_unix_s": 1788683510,
+                    "quality": {
+                      "presence_z": 2.043563,
+                      "motion_rate": 0.13619404,
+                      "frames": 1072,
+                      "accepted": true
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "roomB node3 192 robust",
+        "output": "v2/enrollment-roomB-node3-192-robust.json",
+        "command": "enroll --node-id 3 --tier esp32_ht40_192 --baseline baseline-roomB-node3-192-robust.bin --output enrollment-roomB-node3-192-robust.json",
+        "accepted": "7/8",
+        "data": {
+          "room_id": "default",
+          "baseline_id": "00000000-0000-0000-f3ca-d7f794feade9",
+          "fs_hz": 15.0,
+          "anchors": [
+            {
+              "room_id": "default",
+              "label": "stand_still",
+              "features": {
+                "mean": 14.006483,
+                "variance": 0.8949623,
+                "motion": 0.5646481,
+                "breathing_score": 0.1537733,
+                "breathing_hz": 0.10489511,
+                "heart_score": 0.13188167,
+                "heart_hz": 1.25
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "sit",
+              "features": {
+                "mean": 13.933279,
+                "variance": 1.1764805,
+                "motion": 0.5804265,
+                "breathing_score": 0.13134842,
+                "breathing_hz": 0.23809524,
+                "heart_score": 0.05359952,
+                "heart_hz": 2.142857
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "lie_down",
+              "features": {
+                "mean": 13.977151,
+                "variance": 0.67580813,
+                "motion": 0.50235903,
+                "breathing_score": 0.11046535,
+                "breathing_hz": 0.1388889,
+                "heart_score": 0.09786454,
+                "heart_hz": 1.3636364
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "breathe_slow",
+              "features": {
+                "mean": 14.368142,
+                "variance": 0.64637643,
+                "motion": 0.51155597,
+                "breathing_score": 0.14329097,
+                "breathing_hz": 0.5555556,
+                "heart_score": 0.09781616,
+                "heart_hz": 2.5
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "breathe_normal",
+              "features": {
+                "mean": 14.447417,
+                "variance": 0.4741281,
+                "motion": 0.5029702,
+                "breathing_score": 0.13125956,
+                "breathing_hz": 0.10638298,
+                "heart_score": 0.06450821,
+                "heart_hz": 1.3636364
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "small_move",
+              "features": {
+                "mean": 14.440642,
+                "variance": 0.9483861,
+                "motion": 0.49914184,
+                "breathing_score": 0.16781542,
+                "breathing_hz": 0.114503816,
+                "heart_score": 0.06404246,
+                "heart_hz": 2.5
+              }
+            },
+            {
+              "room_id": "default",
+              "label": "sleep_posture",
+              "features": {
+                "mean": 14.522274,
+                "variance": 1.6515026,
+                "motion": 0.6808658,
+                "breathing_score": 0.088531315,
+                "breathing_hz": 0.625,
+                "heart_score": 0.04938709,
+                "heart_hz": 2.5
+              }
+            }
+          ],
+          "session": {
+            "room_id": "default",
+            "baseline_id": "00000000-0000-0000-f3ca-d7f794feade9",
+            "events": [
+              {
+                "Started": {
+                  "room_id": "default",
+                  "baseline_id": "00000000-0000-0000-f3ca-d7f794feade9",
+                  "at": 1788685840
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "empty",
+                  "reason": "room not empty (presence_z 13.90 > 1.00) — clear the room",
+                  "at": 1788685863
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "empty",
+                  "reason": "room not empty (presence_z 14.14 > 1.00) — clear the room",
+                  "at": 1788685886
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "stand_still",
+                    "captured_at_unix_s": 1788685909,
+                    "quality": {
+                      "presence_z": 12.109069,
+                      "motion_rate": 0.33692724,
+                      "frames": 742,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorRejected": {
+                  "label": "sit",
+                  "reason": "too much motion (61% > 60%) for a still anchor — hold still",
+                  "at": 1788685932
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "sit",
+                    "captured_at_unix_s": 1788685955,
+                    "quality": {
+                      "presence_z": 6.565621,
+                      "motion_rate": 0.5565912,
+                      "frames": 751,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "lie_down",
+                    "captured_at_unix_s": 1788685978,
+                    "quality": {
+                      "presence_z": 8.370305,
+                      "motion_rate": 0.3611111,
+                      "frames": 756,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "breathe_slow",
+                    "captured_at_unix_s": 1788686011,
+                    "quality": {
+                      "presence_z": 12.015347,
+                      "motion_rate": 0.48093024,
+                      "frames": 1075,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "breathe_normal",
+                    "captured_at_unix_s": 1788686044,
+                    "quality": {
+                      "presence_z": 12.225884,
+                      "motion_rate": 0.45943484,
+                      "frames": 1097,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "small_move",
+                    "captured_at_unix_s": 1788686067,
+                    "quality": {
+                      "presence_z": 8.856252,
+                      "motion_rate": 0.38370565,
+                      "frames": 761,
+                      "accepted": true
+                    }
+                  }
+                }
+              },
+              {
+                "AnchorAccepted": {
+                  "anchor": {
+                    "label": "sleep_posture",
+                    "captured_at_unix_s": 1788686100,
+                    "quality": {
+                      "presence_z": 9.353501,
+                      "motion_rate": 0.36594543,
+                      "frames": 1063,
+                      "accepted": true
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "findings": {
+    "root_cause": "Calibration was captured with --tier esp32_ht40_192 (192-subcarrier baselines), but enrollment was run with --tier ht40. BaselineCalibration::deviation() for an Ht40 baseline accepts both 192 and 128 subcarrier frames, and for 128 it uses only the first 128 bins — so 128-subcarrier frames were compared against 192-subcarrier baselines, inflating presence_z for Node2/Node4.",
+    "node_empty_presence_z_observed": {
+      "node1": 1.4,
+      "node2": 5.6,
+      "node3": 1.8,
+      "node4": 4.4
+    },
+    "node_amp_std_median": {
+      "node1": 3.56,
+      "node2": 0.98,
+      "node3": 3.11,
+      "node4": 1.12
+    },
+    "note": "Node2/Node4 baselines have much smaller per-subcarrier std (median ~1) than Node1/Node3 (~3-3.6); with AMP_STD_FLOOR=1e-12, small RF shifts become large z. Baseline amplitude also drifted +4..+5 units between calibration and empty enrollment.",
+    "next_step": "Re-run multi-node enrollment matching the calibration tier: OPENBLAS_SYSTEM=1 cargo run -p wifi-densepose-cli -- enroll --all-nodes --baseline-dir ./baselines/roomB --output-dir ./enrollments/roomB-test --tier esp32_ht40_192. Then enforce baseline subcarrier count in enroll so a 192 baseline never consumes 128 frames."
+  }
+}
