@@ -201,6 +201,15 @@ async fn capture_anchor(
     let mut series: Vec<f32> = Vec::new();
     let mut normalized_z_sum = 0.0f64;
     let mut normalized_z_frames = 0u32;
+    // ADR-135 geometry guard: a frame may only be compared against a baseline
+    // that was built from the SAME subcarrier count. A 192-bin baseline must
+    // never consume 64/128-bin frames (and vice versa): mixing counts compares
+    // different physical bins and inflates presence_z. This is the root cause
+    // from the roomB session - calibration ran with esp32_ht40_192 while enroll
+    // ran with --tier ht40, which admitted 128-bin frames against 192-bin
+    // baselines. The baseline's stored subcarrier count is authoritative.
+    let expected_sc = baseline.subcarriers.len();
+    let mut geometry_skipped = 0u32;
     let mut buf = vec![0u8; RECV_BUF];
     let deadline = Instant::now() + Duration::from_secs(label.duration_s() as u64);
 
@@ -213,6 +222,18 @@ async fn capture_anchor(
                     if frame.metadata.device_id.to_string() != expected {
                         continue;
                     }
+                }
+                if frame.num_subcarriers() != expected_sc {
+                    geometry_skipped += 1;
+                    if geometry_skipped <= 3 {
+                        eprintln!(
+                            "[enroll]   WARN skipping {}-subcarrier frame; baseline expects {expected_sc} \
+                             (run `enroll --tier` matching the `calibrate --tier` that built the baseline, \
+                             e.g. esp32_ht40_192)",
+                            frame.num_subcarriers()
+                        );
+                    }
+                    continue;
                 }
                 recorder.record_frame(baseline, &frame);
 
@@ -233,6 +254,12 @@ async fn capture_anchor(
                 series.push(frame_scalar(&frame));
             }
         }
+    }
+
+    if geometry_skipped > 0 {
+        eprintln!(
+            "[enroll]   note: skipped {geometry_skipped} frame(s) whose subcarrier count != baseline ({expected_sc})",
+        );
     }
 
     let (anchor, reason) = recorder.finalize(gate, now_unix());
@@ -277,6 +304,8 @@ struct NodeAnchorCapture {
     normalized_z_sum: f64,
     normalized_z_frames: u32,
     printed_diagnostic: bool,
+    /// Frames skipped because their subcarrier count did not match the node baseline.
+    skipped_geometry: u32,
 }
 
 /// Load every baseline-node<N>.bin from a directory.
@@ -377,6 +406,7 @@ async fn capture_anchor_all_nodes(
                 normalized_z_sum: 0.0,
                 normalized_z_frames: 0,
                 printed_diagnostic: false,
+                skipped_geometry: 0,
             },
         );
     }
@@ -403,6 +433,20 @@ async fn capture_anchor_all_nodes(
             let Some(state) = states.get_mut(&node_id) else {
                 continue;
             };
+
+            if frame.num_subcarriers() != baseline.subcarriers.len() {
+                state.skipped_geometry += 1;
+                if state.skipped_geometry <= 3 {
+                    eprintln!(
+                        "[enroll] node {} WARN skipping {}-subcarrier frame; baseline expects {} \
+                         (run `enroll --tier` matching the `calibrate --tier` that built the baseline)",
+                        node_id,
+                        frame.num_subcarriers(),
+                        baseline.subcarriers.len()
+                    );
+                }
+                continue;
+            }
 
             state.recorder.record_frame(baseline, &frame);
 
@@ -440,6 +484,14 @@ async fn capture_anchor_all_nodes(
             .expect("node state exists");
 
         let (anchor, reason) = state.recorder.finalize(gate, now_unix());
+
+        if state.skipped_geometry > 0 {
+            eprintln!(
+                "[enroll] node {} note: skipped {} frame(s) whose subcarrier count != baseline",
+                node_id,
+                state.skipped_geometry
+            );
+        }
 
         let normalized_z = if state.normalized_z_frames == 0 {
             0.0
