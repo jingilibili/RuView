@@ -177,6 +177,41 @@ pub struct EnrollArgs {
     /// Output directory for enrollment-node<N>.json files in --all-nodes mode.
     #[arg(long, default_value = "./enrollments")]
     pub output_dir: String,
+
+    /// Countdown seconds before each anchor capture starts. Raise this when the
+    /// operator needs time to move into position between anchors.
+    #[arg(long, default_value_t = 3)]
+    pub lead_in_s: u32,
+
+    /// Presence test threshold as a relative mean-amplitude shift versus this
+    /// session's own `empty` capture (0.0075 = 0.75%). `0` disables the shift
+    /// test and falls back to the legacy per-subcarrier `presence_z` gate.
+    #[arg(long, default_value_t = 0.0)]
+    pub min_mean_shift: f32,
+
+    /// Gate override: minimum mean z-score for "a person is present".
+    #[arg(long, default_value_t = 1.5)]
+    pub min_presence_z: f32,
+
+    /// Gate override: maximum mean z-score accepted for the `empty` anchor.
+    #[arg(long, default_value_t = 1.0)]
+    pub empty_max_z: f32,
+
+    /// Gate override: maximum motion rate accepted for a "still" anchor.
+    #[arg(long, default_value_t = 0.6)]
+    pub max_still_motion: f32,
+
+    /// Gate override: minimum motion rate required for the `move` anchor.
+    #[arg(long, default_value_t = 0.3)]
+    pub min_move_motion: f32,
+
+    /// In `--all-nodes` mode, how many nodes must see the mean-amplitude shift
+    /// before the anchor counts as "a person is present" for every node. A
+    /// person is a property of the room, not of one node: a node whose link is
+    /// dominated by a strong direct path (live data: node 1 shifted only
+    /// 0.0-2.4% while nodes 2/3 shifted up to 13.7%) must not veto the anchor.
+    #[arg(long, default_value_t = 1)]
+    pub presence_votes: u32,
 }
 
 /// Capture one anchor: returns (accepted feature?, anchor verdict, reason).
@@ -189,9 +224,11 @@ async fn capture_anchor(
     fs_hz: f32,
     room_id: &str,
     node_id: Option<u8>,
+    lead_in_s: u32,
+    reference_mean: Option<f32>,
 ) -> Result<(Option<AnchorFeature>, Anchor, Option<String>)> {
     eprintln!("\n[enroll] {} — {}", label.as_str(), label.prompt());
-    for c in (1..=3).rev() {
+    for c in (1..=lead_in_s.max(1)).rev() {
         eprintln!("[enroll]   starting in {c}…");
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -262,8 +299,6 @@ async fn capture_anchor(
         );
     }
 
-    let (anchor, reason) = recorder.finalize(gate, now_unix());
-
     let normalized_z = if normalized_z_frames == 0 {
         0.0
     } else {
@@ -276,6 +311,17 @@ async fn capture_anchor(
     );
 
     let feature_all = AnchorFeature::from_series(room_id, label, &series, fs_hz);
+    let mean_shift_rel = reference_mean.and_then(|reference| {
+        if gate.min_mean_shift > 0.0 && reference.abs() > f32::EPSILON {
+            Some((feature_all.features.mean - reference) / reference)
+        } else {
+            None
+        }
+    });
+    if let Some(shift) = mean_shift_rel {
+        eprintln!("[enroll]   presence shift: {:+.2}% vs the empty capture", 100.0 * shift);
+    }
+    let (anchor, reason) = recorder.finalize(gate, now_unix(), mean_shift_rel);
     eprintln!(
         "[enroll]   features: mean={:.4} variance={:.6} motion={:.6} breathing_score={:.3} breathing_hz={:.3} heart_score={:.3} heart_hz={:.3} frames={}",
         feature_all.features.mean,
@@ -288,12 +334,9 @@ async fn capture_anchor(
         series.len(),
     );
 
-    let feature = if anchor.quality.accepted {
-        Some(feature_all)
-    } else {
-        None
-    };
-    Ok((feature, anchor, reason))
+    // The caller decides; keeping the feature lets the room-level consensus in
+    // `--all-nodes` mode re-evaluate a node that a per-node gate rejected.
+    Ok((Some(feature_all), anchor, reason))
 }
 
 
@@ -382,10 +425,12 @@ async fn capture_anchor_all_nodes(
     tier: &str,
     fs_hz: f32,
     room_id: &str,
+    lead_in_s: u32,
+    references: &HashMap<u8, f32>,
 ) -> Result<HashMap<u8, (Option<AnchorFeature>, Anchor, Option<String>)>> {
     eprintln!("\n[enroll] {} — {}", label.as_str(), label.prompt());
 
-    for c in (1..=3).rev() {
+    for c in (1..=lead_in_s.max(1)).rev() {
         eprintln!("[enroll]   starting in {c}…");
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -483,7 +528,19 @@ async fn capture_anchor_all_nodes(
             .remove(&node_id)
             .expect("node state exists");
 
-        let (anchor, reason) = state.recorder.finalize(gate, now_unix());
+        let feature_all =
+            AnchorFeature::from_series(room_id, label, &state.series, fs_hz);
+        let mean_shift_rel = references.get(&node_id).and_then(|reference| {
+            if gate.min_mean_shift > 0.0 && reference.abs() > f32::EPSILON {
+                Some((feature_all.features.mean - reference) / reference)
+            } else {
+                None
+            }
+        });
+        if let Some(shift) = mean_shift_rel {
+            eprintln!("[enroll] node {} presence shift: {:+.2}% vs the empty capture", node_id, 100.0 * shift);
+        }
+        let (anchor, reason) = state.recorder.finalize(gate, now_unix(), mean_shift_rel);
 
         if state.skipped_geometry > 0 {
             eprintln!(
@@ -506,9 +563,6 @@ async fn capture_anchor_all_nodes(
             state.normalized_z_frames
         );
 
-        let feature_all =
-            AnchorFeature::from_series(room_id, label, &state.series, fs_hz);
-
         eprintln!(
             "[enroll] node {} features: mean={:.4} variance={:.6} motion={:.6} breathing_score={:.3} breathing_hz={:.3} heart_score={:.3} heart_hz={:.3} frames={}",
             node_id,
@@ -522,13 +576,7 @@ async fn capture_anchor_all_nodes(
             state.series.len(),
         );
 
-        let feature = if anchor.quality.accepted {
-            Some(feature_all)
-        } else {
-            None
-        };
-
-        results.insert(node_id, (feature, anchor, reason));
+        results.insert(node_id, (Some(feature_all), anchor, reason));
     }
 
     Ok(results)
@@ -541,7 +589,14 @@ async fn enroll_all_nodes(args: EnrollArgs) -> Result<()> {
         anyhow::anyhow!("cannot create output directory {}: {e}", args.output_dir)
     })?;
 
-    let gate = AnchorQualityGate::default();
+    let gate = AnchorQualityGate {
+        min_presence_z: args.min_presence_z,
+        empty_max_z: args.empty_max_z,
+        max_still_motion: args.max_still_motion,
+        min_move_motion: args.min_move_motion,
+        min_mean_shift: args.min_mean_shift,
+        ..AnchorQualityGate::default()
+    };
     let mut sessions: HashMap<u8, EnrollmentSession> = HashMap::new();
     let mut features: HashMap<u8, Vec<AnchorFeature>> = HashMap::new();
 
@@ -555,10 +610,18 @@ async fn enroll_all_nodes(args: EnrollArgs) -> Result<()> {
         features.insert(node_id, Vec::new());
     }
 
-    let mut accepted: HashMap<u8, bool> =
-        baselines.keys().map(|&id| (id, false)).collect();
+    // Session reference for the mean-shift presence test, per node: the mean
+    // amplitude of that node's accepted `empty` capture.
+    let mut references: HashMap<u8, f32> = HashMap::new();
 
     for label in AnchorLabel::SEQUENCE {
+        // Per-anchor acceptance map. A node that accepted THIS label must not be
+        // re-captured for it, but every node must still be evaluated for the
+        // next label. Declaring this outside the label loop marked nodes as
+        // permanently "accepted", so once `empty` passed, anchors 2..N skipped
+        // every node and the run recorded only 1/8 anchors.
+        let mut accepted: HashMap<u8, bool> =
+            baselines.keys().map(|&id| (id, false)).collect();
         let mut label_complete = false;
 
         for attempt in 1..=args.attempts {
@@ -570,8 +633,43 @@ async fn enroll_all_nodes(args: EnrollArgs) -> Result<()> {
                 &args.tier,
                 args.fs_hz,
                 &args.room_id,
+                args.lead_in_s,
+                &references,
             )
             .await?;
+
+            // Room-level presence consensus (see --presence-votes): if enough
+            // nodes see the shift, the anchor is presence-valid for all of them.
+            if gate.min_mean_shift > 0.0 && args.presence_votes > 0 {
+                let mut votes = 0u32;
+                for (&node_id, value) in results.iter() {
+                    let (feat, _, _) = value;
+                    let (Some(feat), Some(reference)) = (feat.as_ref(), references.get(&node_id))
+                    else {
+                        continue;
+                    };
+                    if reference.abs() > f32::EPSILON {
+                        let shift = (feat.features.mean - reference) / reference;
+                        if shift.abs() >= gate.min_mean_shift {
+                            votes += 1;
+                        }
+                    }
+                }
+                if votes >= args.presence_votes {
+                    for value in results.values_mut() {
+                        let (_, anchor, reason) = value;
+                        let (quality, why) = gate.evaluate(
+                            label,
+                            anchor.quality.presence_z,
+                            anchor.quality.motion_rate,
+                            anchor.quality.frames,
+                            Some(1.0),
+                        );
+                        anchor.quality = quality;
+                        *reason = why;
+                    }
+                }
+            }
 
             label_complete = true;
 
@@ -597,6 +695,9 @@ async fn enroll_all_nodes(args: EnrollArgs) -> Result<()> {
                     );
 
                     if let Some(f) = feat {
+                        if label == AnchorLabel::Empty {
+                            references.insert(node_id, f.features.mean);
+                        }
                         features.get_mut(&node_id).unwrap().push(f);
                     }
 
@@ -718,7 +819,14 @@ pub async fn enroll(args: EnrollArgs) -> Result<()> {
 async fn enroll_single_node(args: EnrollArgs) -> Result<()> {
     let baseline = load_baseline(&args.baseline)?;
     let baseline_id = baseline.calibration_uuid().to_string();
-    let gate = AnchorQualityGate::default();
+    let gate = AnchorQualityGate {
+        min_presence_z: args.min_presence_z,
+        empty_max_z: args.empty_max_z,
+        max_still_motion: args.max_still_motion,
+        min_move_motion: args.min_move_motion,
+        min_mean_shift: args.min_mean_shift,
+        ..AnchorQualityGate::default()
+    };
 
     let addr = format!("{}:{}", args.bind, args.udp_port);
     let socket = UdpSocket::bind(&addr)
@@ -742,6 +850,9 @@ async fn enroll_single_node(args: EnrollArgs) -> Result<()> {
         EnrollmentSession::new(&args.room_id, &baseline_id, now_unix());
 
     let mut features: Vec<AnchorFeature> = Vec::new();
+    // Session reference for the mean-shift presence test: the `empty` anchor's
+    // own capture mean for this node.
+    let mut reference_mean: Option<f32> = None;
 
     for label in AnchorLabel::SEQUENCE {
         let mut accepted = false;
@@ -756,6 +867,8 @@ async fn enroll_single_node(args: EnrollArgs) -> Result<()> {
                 args.fs_hz,
                 &args.room_id,
                 args.node_id,
+                args.lead_in_s,
+                reference_mean,
             )
             .await?;
 
@@ -768,6 +881,9 @@ async fn enroll_single_node(args: EnrollArgs) -> Result<()> {
                 );
 
                 if let Some(f) = feat {
+                    if label == AnchorLabel::Empty {
+                        reference_mean = Some(f.features.mean);
+                    }
                     features.push(f);
                 }
 

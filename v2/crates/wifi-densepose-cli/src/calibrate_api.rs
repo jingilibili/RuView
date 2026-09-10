@@ -569,7 +569,7 @@ async fn ingest_loop(
                 if enroll_done {
                     if let Some(mut ec) = active_enroll.take() {
                         let gate = AnchorQualityGate::default();
-                        let (anchor, reason) = ec.recorder.finalize(&gate, (unix_ms() / 1000) as i64);
+                        let (anchor, reason) = ec.recorder.finalize(&gate, (unix_ms() / 1000) as i64, None);
                         let mut verdict = AnchorVerdict {
                             label: ec.label.as_str().into(),
                             accepted: anchor.quality.accepted,
