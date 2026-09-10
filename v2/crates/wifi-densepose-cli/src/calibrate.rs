@@ -482,6 +482,7 @@ pub(crate) fn tier_config(tier: &str) -> CalibrationConfig {
         "ht40" => CalibrationConfig::ht40(),
         "esp32_ht40_192" => CalibrationConfig::ht40_192(),
         "esp32_ht40_128" => CalibrationConfig::ht40_128(),
+        "esp32_ht40_306" => CalibrationConfig::ht40_306(),
         "he20" => CalibrationConfig::he20(),
         "he40" => CalibrationConfig::he40(),
         _      => CalibrationConfig::ht20(), // ht20 or unknown → safe default
@@ -600,7 +601,15 @@ fn validate_args(args: &CalibrateArgs) -> Result<()> {
             args.duration_s
         );
     }
-    let valid = ["ht20", "ht40", "esp32_ht40_192", "esp32_ht40_128", "he20", "he40"];
+    let valid = [
+        "ht20",
+        "ht40",
+        "esp32_ht40_192",
+        "esp32_ht40_128",
+        "esp32_ht40_306",
+        "he20",
+        "he40",
+    ];
     if !valid.contains(&args.tier.to_ascii_lowercase().as_str()) {
         bail!(
             "--tier must be one of {:?} (got {:?})",
@@ -648,6 +657,13 @@ mod tests {
     fn test_tier_config_ht40() {
         let cfg = tier_config("ht40");
         assert_eq!(cfg.num_active, 114);
+    }
+
+    #[test]
+    fn test_tier_config_esp32_ht40_306() {
+        let cfg = tier_config("esp32_ht40_306");
+        assert_eq!(cfg.num_subcarriers, 306);
+        assert_eq!(cfg.num_active, 306);
     }
 
     #[test]
