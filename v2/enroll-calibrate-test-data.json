@@ -1071,5 +1071,102 @@
     },
     "note": "Node2/Node4 baselines have much smaller per-subcarrier std (median ~1) than Node1/Node3 (~3-3.6); with AMP_STD_FLOOR=1e-12, small RF shifts become large z. Baseline amplitude also drifted +4..+5 units between calibration and empty enrollment.",
     "next_step": "Re-run multi-node enrollment matching the calibration tier: OPENBLAS_SYSTEM=1 cargo run -p wifi-densepose-cli -- enroll --all-nodes --baseline-dir ./baselines/roomB --output-dir ./enrollments/roomB-test --tier esp32_ht40_192. Then enforce baseline subcarrier count in enroll so a 192 baseline never consumes 128 frames."
+  },
+  "roomB_session_2026_09_10": {
+    "summary": "Fresh real-hardware session on the new LAN after the modem change. Recalibrated the empty room, then diagnosed why the enrollment gate rejected every person-present anchor.",
+    "hardware": {
+      "router": "Tenda (SSID 'Tenda', LAN 192.168.1.0/24, gateway 192.168.1.1)",
+      "pc_lan_ip": "192.168.1.5 (Wi-Fi, internet via phone USB tether)",
+      "wsl_ip": "172.22.100.172 (NAT)",
+      "nodes": {
+        "node1": {
+          "mac": "28:84:85:92:86:4c",
+          "lan_ip": "192.168.1.4"
+        },
+        "node2": {
+          "mac": "28:84:85:92:7a:b0",
+          "lan_ip": "192.168.1.2"
+        },
+        "node3": {
+          "mac": "28:84:85:92:76:70",
+          "lan_ip": "192.168.1.3"
+        },
+        "node4": {
+          "mac": "28:84:85:88:fb:b0",
+          "lan_ip": "unplugged during this session"
+        }
+      },
+      "firmware": "v0.8.8 (ota_0), ESP-IDF v5.4 build",
+      "provisioning": {
+        "target": "192.168.1.5:5005",
+        "edge_tier": 0,
+        "note": "NVS target/edge-tier were stale (172.22.100.172 + vitals tier); all boards were re-provisioned over USB with provision.py."
+      },
+      "data_path": "ESP -> 192.168.1.5:5005 (Windows) -> udp_forwarder.py -> 172.22.100.172:5005 (WSL)"
+    },
+    "csi_observations": {
+      "channel": "2412 MHz (channel 1)",
+      "subcarrier_histogram": {
+        "306": "~42%",
+        "192": "~54%",
+        "188/128/64": "remainder"
+      },
+      "rssi_spread_by_group": {
+        "192": "8-32 dB between frames (mixed transmitters)",
+        "306": "0-1 dB between frames (single transmitter)"
+      },
+      "per_subcarrier_cv": {
+        "192": "~23.5%",
+        "306": "~11-15%"
+      },
+      "ppdu_type_byte": "always 0 - not usable for frame selection",
+      "note": "The S3 uses the legacy wifi_csi_config_t bool layout (ltf_merge_en=true, channel_filter_en=false); the acquire_csi_ht40 bitfield only exists on CONFIG_SOC_WIFI_HE_SUPPORT targets, so the earlier ht40 toggle never applied to the S3."
+    },
+    "calibration": {
+      "command": "calibrate --all-nodes --output-dir ./baselines/roomB --tier esp32_ht40_192 --duration-s 120",
+      "frames": {
+        "node1": 3483,
+        "node2": 3668,
+        "node3": 3802
+      },
+      "subcarriers": 192,
+      "note": "baselines/roomB/baseline-node4.bin was archived as .stale-sep6 (node 4 not powered)."
+    },
+    "gate_diagnosis": {
+      "problem": "AnchorQualityGate tested presence_z = mean over frames of the MEDIAN over subcarriers of |amp-baseline|/sigma. That measures frame-to-frame jitter, not the presence shift: it read ~0.8 for BOTH the empty room and the occupied room, so no threshold could separate them.",
+      "presence_signal": "A person shifts the capture MEAN amplitude by 0.4-13.7%, sign-inconsistent (multipath phase), standard error ~0.08 amplitude units over a capture -> 6-12 sigma. Measured with ~1300 frames per 30 s phase.",
+      "per_node_sensitivity": {
+        "node1": "0.0-2.4% (RSSI -44 dBm, strong direct AP path) - insensitive",
+        "node2": "0.4-13.7% (RSSI -31 dBm mode) - sensitive",
+        "node3": "0.1-6.8% (RSSI -55 dBm) - sensitive"
+      },
+      "other_findings": [
+        "The empty-room z drifts above empty_max_z (1.0) within an hour of calibration.",
+        "The Delta-z motion metric is noise-dominated: empty 52-66%, still person 63-78%.",
+        "enroll --all-nodes never evaluated anchors 2..8 once a node accepted anchor 1 (fixed)."
+      ]
+    },
+    "fixes_applied": [
+      "per-anchor acceptance map reset (anchors 2..8 were skipped)",
+      "subcarrier geometry guard: a 192 baseline never consumes 64/128 frames",
+      "new tier esp32_ht40_306",
+      "udp_forwarder.py: WSL-IP auto-detect, throughput summary, error handling",
+      "enroll --lead-in-s (configurable countdown)",
+      "gate: mean-amplitude shift (|magnitude|) replaces presence_z; session empty capture is the reference",
+      "enroll --all-nodes: room-level presence consensus (--presence-votes)",
+      "gate threshold overrides: --min-presence-z, --empty-max-z, --max-still-motion, --min-move-motion"
+    ],
+    "resume_checklist": [
+      "power all nodes (they are USB-powered) and confirm each streams: python3 /mnt/c/.../measure_csi2.py",
+      "start the forwarder on Windows: py -3 -u udp_forwarder.py  (binds 0.0.0.0:5005 -> WSL:5005)",
+      "recalibrate the empty room: calibrate --all-nodes --output-dir ./baselines/roomB --tier esp32_ht40_192 --duration-s 120",
+      "run the enrollment with the consensus gate:",
+      "  enroll --all-nodes --baseline-dir ./baselines/roomB --output-dir ./enrollments/roomB \\",
+      "    --tier esp32_ht40_192 --attempts 3 --lead-in-s 15 --min-mean-shift 0.0075 \\",
+      "    --presence-votes 1 --empty-max-z 2.5 --max-still-motion 0.85",
+      "then: train-room --enrollment ./enrollments/roomB/enrollment-node1.json --output ./rooms/roomB",
+      "open question: node 1 is physically insensitive (strong direct AP path) - consider moving it",
+      "            or using node-to-node links so the measured path crosses the room."
+    ]
   }
 }
