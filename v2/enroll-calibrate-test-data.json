@@ -1294,5 +1294,103 @@
         "13/13 engine_bridge tests pass: cargo test -p wifi-densepose-sensing-server --bin sensing-server engine_bridge"
       ]
     }
+  },
+  "sleep_phase0_vitals_chain_2026_09_12": {
+    "goal": "Phase 0 of the sleep-monitoring work: get CSI-derived breathing/heart-rate publishing continuously on real hardware.",
+    "evidence_class": "MEASURED",
+    "starting_symptom": {
+      "endpoint": "GET /api/v1/vital-signs",
+      "observed": "{authority: abstained, breathing_samples: 0, heartbeat_samples: 0} for a whole session",
+      "reality": "the same server published ~44 sensing_update frames/s carrying real CSI and per-node vitals were being computed every frame"
+    },
+    "root_causes": [
+      {
+        "id": "wrong_detector_reported",
+        "detail": "the endpoint reported the global s.vital_detector, which only the simulator paths feed; the live ESP32 path feeds the per-node NodeState::vital_detector and mirrors only the smoothed result into s.latest_vitals",
+        "fix": "report the live cohort (max across nodes) plus a per-node breakdown and a source field (per_node_max / global)"
+      },
+      {
+        "id": "wrong_clock_used",
+        "detail": "the detector was tuned to csi_fps_ema, which counts grid-rejected arrivals too (38-47 Hz here) while the detector consumes only accepted frames (~7-21 Hz), so window capacities were about 2x too large",
+        "fix": "a second EMA over accepted frames only, surfaced as accepted_sample_rate_hz"
+      },
+      {
+        "id": "single_reading_retunes",
+        "detail": "any >20% move of the rate estimate retuned the detector and cleared its history, and the estimate swings with bursty arrivals even when the clock is unchanged",
+        "fix": "a change must persist across 25 consecutive mutually consistent evaluations (RATE_CHANGE_CONFIRMATIONS)"
+      },
+      {
+        "id": "irregular_sampling_stream",
+        "detail": "the remaining wipes were real: the grid-gated arrival rate genuinely moves between ~7 and ~21 Hz over seconds (capacities 212, 430, 441, 544, 554, 625 at a 30 s window), so no rate estimate can stabilise it and the spectra need a uniform clock",
+        "fix": "resample: one detector sample per fixed 100 ms period holding the newest accepted frame (zero-order hold), detector configured for 10 Hz once"
+      }
+    ],
+    "measured_before_after": {
+      "before": {
+        "breathing_fill_sequence_node1": [
+          44,
+          250,
+          441,
+          441,
+          441,
+          20,
+          130
+        ],
+        "breathing_fill_sequence_node3": [
+          45,
+          124,
+          345,
+          109,
+          14,
+          127,
+          55
+        ],
+        "max_signal_quality": 0.5,
+        "max_heartbeat_confidence": 0.662,
+        "max_breathing_confidence": 0.787
+      },
+      "after": {
+        "breathing_fill": "300/300 held for 45+ s on all three nodes",
+        "heartbeat_fill": "150/150 held for 45+ s on all three nodes",
+        "signal_quality": [
+          0.432,
+          0.5,
+          0.495
+        ],
+        "heart_rate_bpm": {
+          "node1": 55.06,
+          "node2": 54.66,
+          "node3": 58.6
+        },
+        "breathing_rate_bpm": {
+          "node1": 9.77,
+          "node2": 9.38,
+          "node3": 9.38
+        },
+        "max_heartbeat_confidence": 0.628,
+        "max_breathing_confidence": 0.455
+      }
+    },
+    "gate_status": {
+      "signal_quality_gate_0.40": "PASS (0.43-0.50)",
+      "heartbeat_confidence_gate_0.55": "PASS (up to 0.628, intermittent)",
+      "breathing_confidence_gate_0.55": "FAIL (peaks at 0.455) — next work item",
+      "explicit_calibration_fresh": "FAIL — needs a 10-minute empty-room collection via POST /api/v1/calibration/start?source_node_id=N then /stop (min_frames 1000, min_duration_s 600)",
+      "single_occupant": "PASS while the operator is alone (person_count 1)"
+    },
+    "diagnostic_surface": {
+      "endpoint": "GET /api/v1/vital-signs/diagnostics",
+      "availability": "404 unless RUVIEW_VITALS_DIAGNOSTICS=1",
+      "labelling": "authority diagnostic_only, every value tagged UNVALIDATED (ADR-021/ADR-293 publication rule preserved)",
+      "note": "raw per-node estimates, buffer fill, csi_fps_ema and accepted_sample_rate_hz — the stream the sleep work needs for Phase 1 recording"
+    },
+    "pull_request": "https://github.com/ruvnet/RuView/pull/1912",
+    "next_steps": [
+      "empty-room calibration: POST /api/v1/calibration/start?source_node_id=<best node> then keep the room empty for 600 s and POST /api/v1/calibration/stop",
+      "raise breathing confidence above 0.55 (spectral peak significance on the mean-amplitude series)",
+      "Phase 1: record overnight CSI + vitals + timestamps to disk for ML training",
+      "Phase 2: reference labels (wearable/PSG) via the ADR-293 ground-truth ingest"
+    ],
+    "recorded_at_unix_s": 1789235472
   }
 }
