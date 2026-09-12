@@ -1579,5 +1579,90 @@
       "1912": "vitals chain: fixed clock, stall verdict, corroborated publication (2 files, 3 commits)"
     },
     "recorded_at_unix_s": 1789239275
+  },
+  "sleep_phase0d_breathing_confidence_2026_09_12": {
+    "goal": "Clear the last non-calibration blocker on the vitals publication gate: breathing confidence.",
+    "evidence_class": "MEASURED",
+    "breathing_window_progression": {
+      "30s": {
+        "best_confidence": 0.408,
+        "node_agreement_bpm": "9.4 vs 11.4 (2.0 apart)"
+      },
+      "60s": {
+        "best_confidence": 0.54,
+        "node_agreement_bpm": "9.88 vs 10.0 (0.12 apart)"
+      },
+      "90s": {
+        "best_confidence": 0.656,
+        "gate": 0.55,
+        "result": "PASS"
+      },
+      "why": "the confidence is an FFT peak-to-band-mean ratio over a 0.4 Hz-wide band, so it grows with the number of in-band bins; the metric is window-dependent by construction and that is documented in the code rather than hidden"
+    },
+    "signal_quality_decoupling": {
+      "problem": "compute_signal_quality scaled with breathing_buffer.len()/capacity, so a longer breathing window pushed the signal-quality gate out with it",
+      "fix": "the fill factor now reads the heartbeat buffer (shorter, fills first); each metric's own confidence still gates its own claim",
+      "measured": "signal_quality 0.50 with the gate at 0.40, reached ~40 s after start"
+    },
+    "three_node_corroboration_measured": {
+      "node1": {
+        "breathing_bpm": 10.25,
+        "breathing_confidence": 0.425,
+        "heart_rate_bpm": 56.3,
+        "heartbeat_confidence": 0.437
+      },
+      "node2": {
+        "breathing_bpm": 9.38,
+        "breathing_confidence": 0.478,
+        "heart_rate_bpm": 51.9,
+        "heartbeat_confidence": 0.479
+      },
+      "node3": {
+        "breathing_bpm": 9.38,
+        "breathing_confidence": 0.627,
+        "heart_rate_bpm": 68.1,
+        "heartbeat_confidence": 0.368
+      },
+      "selected": {
+        "breathing_rate_bpm": 9.375,
+        "breathing_confidence": 0.656,
+        "heart_rate_bpm": 56.29,
+        "signal_quality": 0.5
+      },
+      "reading": "all three breathing rates agree inside the 3 bpm tolerance; heart rate is taken from the agreeing pair (56.3 and 51.9, 4.4 apart) while 68.1 is treated as the outlier it is — the corroboration rule working on real data"
+    },
+    "calibration_policy": {
+      "persistence": "a finalized runtime calibration is NOT persisted; a restart returns /api/v1/calibration/status to `none`",
+      "bootstrap_route": "POST /api/v1/calibration/bootstrap/promote does store a privacy-reduced image, but a restored image is deliberately a bootstrap prior with negative-only authority (field_model.rs: 'A restored image is only a bootstrap prior'), and explicit_calibration_fresh_at is false whenever bootstrap_baseline_active — so promoting does not keep the vitals gate open",
+      "duration_600_s": "FieldModelConfig::min_calibration_duration_s documents why it is not padding: slow environmental variation (HVAC cycles, thermal drift) can only be observed over time, however fast the nodes stream (#1756). 0 disables it for tests only — not a convenience knob",
+      "expiry": {
+        "baseline_expiry_s": 86400,
+        "fresh_for": "12 h of wall clock",
+        "stale_until": "24 h",
+        "implication": "a calibration taken in the evening covers that night; the next evening needs a new one"
+      },
+      "invalidates_a_calibration": [
+        "a different node set or a node moved (source_node_ids are frozen into the binding)",
+        "a different subcarrier grid (the binding freezes one grid)",
+        "a channel change (the earlier 2412 -> 2462 MHz move) or an AP change",
+        "a room layout change (the field model hashes mesh geometry at calibration time)",
+        "a server restart, since the model is not persisted"
+      ],
+      "recommendation": "keep per-session calibration as the default. It fits sleep monitoring naturally: the room is empty for the 10 minutes before bed, and a calibration taken then is Fresh for the whole night. Persisting a runtime calibration is a real feature worth doing, but it changes a trust rule, so it belongs in its own reviewed change (store the privacy-reduced snapshot on finalize, restore it on startup, and authorize it only while it is within its freshness window AND the current background still matches the stored reference).",
+      "note": "roomB is not the bedroom; the bedroom setup will invalidate any baseline anyway, so persistence buys little until the room is final"
+    },
+    "tooling": {
+      "script": "v2/scripts/calibrate-room.sh",
+      "does": "picks the eligible source with the highest measured grid rate, verifies the feed for 30 s (resets and reports when the bound grid is not arriving), waits out the 600 s, finalizes, then prints the freshness window and the vitals authority",
+      "why": "two ten-minute windows were wasted: one bound to a grid the node left, and the operator-present risk is why it asks first"
+    },
+    "gate_status_now": {
+      "explicit_calibration_fresh": "false — needs one 10-minute empty-room collection",
+      "signal_quality": "0.50 (gate 0.40) PASS",
+      "breathing_confidence": "0.656 (gate 0.55) PASS",
+      "heartbeat_confidence": "0.479 (gate 0.55) FAIL, and the metric is withheld for contradiction anyway",
+      "person_count": "1"
+    },
+    "recorded_at_unix_s": 1789240434
   }
 }
