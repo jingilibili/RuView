@@ -1202,7 +1202,7 @@
         },
         "fix_kind": "operator configuration, no code change",
         "fix": "start the sensing server with WDP_SOFT_GUARD_US=55000 (existing override; hard guard stays at 60 ms and the upstream invariant stagger < soft_guard_us < guard_interval_us still holds)",
-        "upstream_follow_up": "a rate-limited warning or a demotion_reason field on /api/v1/status naming TimestampMismatch, so a silently stripped cycle is visible"
+        "upstream_follow_up": "IMPLEMENTED in PR #1911 commit e2331154: trust.demotion_reason + trust.demotion_count on /api/v1/status, plus a WARN on the first demotion (later ones rate-limited to one per 30 s)"
       },
       {
         "id": "ui_verified_an_amplitude_stripped_frame",
@@ -1262,6 +1262,37 @@
       "1909": "feat(calibration): per-node ESP32 enrollment/calibration - 7 files, 5 commits",
       "1911": "fix(ui): make the live CSI view reach LIVE against the bundled sensing server - 3 files, 3 commits"
     },
-    "recorded_at_unix_s": 1789232439
+    "recorded_at_unix_s": 1789232439,
+    "demotion_surface": {
+      "status": "implemented, commit e2331154 on https://github.com/ruvnet/RuView/pull/1911",
+      "fields": {
+        "trust.demotion_reason": "slug for the trigger of the most recent demoted cycle: timestamp_mismatch / calibration_id_mismatch / phase_alignment_failed / drift_profile_conflict / coherence_drop / geometry_insufficient / mesh_at_risk, joined with '+' when several fired, 'unnamed' if none matched, null when the last cycle was not demoted",
+        "trust.demotion_count": "cumulative demotions since startup (never reset by a clean cycle)"
+      },
+      "demonstration": {
+        "default_soft_guard_20000us": {
+          "demoted": true,
+          "demotion_reason": "timestamp_mismatch",
+          "demotion_count_after_12s": 409,
+          "effective_class": "Restricted",
+          "raw_outputs_suppressed": true,
+          "engine_error_count": 0
+        },
+        "soft_guard_55000us": {
+          "demoted": false,
+          "demotion_reason": null,
+          "demotion_count_after_12s": 27,
+          "effective_class": "Anonymous",
+          "raw_outputs_suppressed": false,
+          "engine_error_count": 0,
+          "note": "the 27 residual demotions are genuine near-miss cycles inside the 55-60 ms band"
+        }
+      },
+      "tests": [
+        "engine_bridge::tests::timestamp_mismatch_demotion_is_named (25 ms spread vs the 20 ms soft guard)",
+        "engine_bridge::tests::a_clean_cycle_clears_the_demotion_reason",
+        "13/13 engine_bridge tests pass: cargo test -p wifi-densepose-sensing-server --bin sensing-server engine_bridge"
+      ]
+    }
   }
 }
