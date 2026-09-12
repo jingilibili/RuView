@@ -36,8 +36,14 @@ const C = {
 
 // ---- Main Class ----
 
+import { reconnectState, scheduleReconnect, cancelReconnect, reconnectSucceeded }
+  from '../../services/ws-reconnect.js';
+
 class Observatory {
   constructor() {
+    // Reconnect bookkeeping (see ui/services/ws-reconnect.js).
+    Object.assign(this, reconnectState());
+    this._candidates = null;
     this._canvas = document.getElementById('observatory-canvas');
     this.settings = { ...DEFAULTS };
 
@@ -470,6 +476,7 @@ class Observatory {
       '3001',
     ].filter(Boolean);
     const candidates = [...new Set(ports.map(p => `${proto}//${host}:${p}/ws/sensing`))];
+    this._candidates = candidates;
     void this._tryLiveCandidate(candidates, 0);
   }
 
@@ -508,6 +515,7 @@ class Observatory {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        reconnectSucceeded(this);
         try { this._liveData = JSON.parse(evt.data); } catch { /* non-JSON frame */ }
         console.log('[Observatory] Sensing server verified at', url);
         this.settings.dataSource = 'ws';
@@ -525,11 +533,17 @@ class Observatory {
     ws.onerror = () => {};
     ws.onmessage = (evt) => { try { this._liveData = JSON.parse(evt.data); } catch { /* non-JSON frame */ } };
     ws.onclose = () => {
-      console.log('[Observatory] WebSocket closed, falling back to demo');
       this._ws = null;
-      this._liveData = null;
-      this.settings.dataSource = 'demo';
-      this._hud.updateSourceBadge('demo', null);
+      // Retry before giving up: a server restart must not leave this page in DEMO
+      // until someone reloads it.
+      scheduleReconnect(this, () => {
+        if (this._candidates) void this._tryLiveCandidate(this._candidates, 0);
+      }, () => {
+        console.log('[Observatory] WebSocket closed, falling back to demo');
+        this._liveData = null;
+        this.settings.dataSource = 'demo';
+        this._hud.updateSourceBadge('demo', null);
+      });
     };
     this._hud.updateSourceBadge('ws', ws);
   }
@@ -773,4 +787,4 @@ class Observatory {
   }
 }
 
-new Observatory();
+window.__observatory = new Observatory();
