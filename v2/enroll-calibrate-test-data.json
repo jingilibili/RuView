@@ -1501,5 +1501,83 @@
       "1914": "empty-room presence honesty + pose view (6 files, stacked on #1912)"
     },
     "recorded_at_unix_s": 1789238233
+  },
+  "sleep_phase0c_corroboration_2026_09_12": {
+    "goal": "Raise heartbeat confidence above the 0.55 publication threshold and make publication depend on evidence rather than on delivery order.",
+    "evidence_class": "MEASURED",
+    "changes": [
+      "per-metric best evidence across fresh nodes instead of the last writer",
+      "heartbeat window 15 s -> 30 s",
+      "cross-node corroboration required when two or more nodes report a metric",
+      "diagnostics now expose reporter counts and the selected values"
+    ],
+    "heartbeat_confidence": {
+      "before_window_change_best": 0.533,
+      "after_window_change_best": 0.738,
+      "gate": 0.55,
+      "buffer": "stable at 300/300 (30 s at 10 Hz)",
+      "note": "confidence is the FFT peak-to-band-mean ratio, so a high value proves a sharp peak, NOT a cardiac peak"
+    },
+    "cross_node_contradiction": {
+      "window_1": {
+        "node1_hr_bpm": 88.6,
+        "node3_hr_bpm": 61.6,
+        "apart_bpm": 27.0
+      },
+      "window_2": {
+        "node1_hr_bpm": 70.33,
+        "node3_hr_bpm": 90.92,
+        "apart_bpm": 20.6
+      },
+      "window_3": {
+        "node1_hr_bpm": 69.9,
+        "node3_hr_bpm": 56.2,
+        "apart_bpm": 13.7,
+        "note": "node3 reported 0.774 confidence for its 56.2 while node1 reported 0.459 for 69.9"
+      },
+      "breathing_agreement": {
+        "window_3": {
+          "node1": 9.4,
+          "node3": 11.4,
+          "apart_bpm": 2.0
+        }
+      },
+      "conclusion": "heart rate from the phase-variance feature is NOT trustworthy on this array: stable within a session, contradictory between nodes, and the estimate pair changes between sessions. Breathing agrees within 2-3 bpm."
+    },
+    "agreement_gate": {
+      "hr_tolerance_bpm": 8.0,
+      "breathing_tolerance_bpm": 3.0,
+      "min_agreeing_nodes": 2,
+      "single_reporter": "publishes (nothing contradicts it)",
+      "verified_live": {
+        "reporters": {
+          "breathing": 2,
+          "heartbeat": 2
+        },
+        "selected": {
+          "breathing_rate_bpm": 9.375,
+          "heart_rate_bpm": null,
+          "breathing_confidence": 0.4076383658884879,
+          "signal_quality": 0.45352429597490473
+        },
+        "reading": "breathing published (2.0 bpm apart), heart rate withheld because the reporters contradict each other, even though one reported 0.774 confidence"
+      }
+    },
+    "gate_status_now": {
+      "explicit_calibration_fresh": "false after the restart — a runtime calibration is not persisted, so publication verification needs a fresh 10-minute collection",
+      "signal_quality": "0.454 (gate 0.40) PASS",
+      "heartbeat_confidence": "0.738 possible on one node, but the metric is withheld for contradiction",
+      "breathing_confidence": "0.408 (gate 0.55) FAIL — the remaining blocker for any publication"
+    },
+    "next_steps": [
+      "raise breathing confidence: the 0.1-0.5 Hz band is narrow, so lengthen the breathing window and decouple signal_quality's fill factor from the breathing buffer first",
+      "investigate the heart-rate feature (cross-subcarrier phase variance) — per-node subcarrier selection, or use only subcarriers whose temporal phase tracks a candidate cardiac peak",
+      "treat breathing rate + variability and movement as the primary sleep signals (actigraphy-style sleep/wake), with heart rate as an unsupported extra until it corroborates",
+      "re-run the 10-minute empty-room calibration when the room is free, then verify that publication actually opens"
+    ],
+    "pull_requests": {
+      "1912": "vitals chain: fixed clock, stall verdict, corroborated publication (2 files, 3 commits)"
+    },
+    "recorded_at_unix_s": 1789239275
   }
 }
