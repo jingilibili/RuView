@@ -50,6 +50,12 @@ export class CsiSimulator {
     // the demo case.
     this.serverPresence = null;
     this.serverPersons = 0;
+    // Published vitals from the sensing update (`null` while the ADR-021/ADR-293
+    // gate abstains) and the gate's own explanation, fetched from
+    // /api/v1/vital-signs so the page can say *why* there are no numbers.
+    this.vitalSigns = null;
+    this.vitalsAuthority = null;
+    this.vitalsReason = null;
 
     // Person influence (updated from video motion)
     this.personPresence = 0;
@@ -79,6 +85,7 @@ export class CsiSimulator {
           this.socketOpen = false;
           this.serverPresence = null;
           this.serverPersons = 0;
+          this.vitalSigns = null;
           // Retry before giving up: a server restart must not leave this page
           // showing SYNTHETIC until someone reloads it.
           scheduleReconnect(this, () => { void this.connectLive(this._liveUrl); }, () => {
@@ -434,6 +441,7 @@ export class CsiSimulator {
       }
       if (typeof cls.motion_level === 'string') this.serverPresence = cls.motion_level;
       this.serverPersons = typeof msg.estimated_persons === 'number' ? msg.estimated_persons : 0;
+      this.vitalSigns = msg.vital_signs || null;
     }
   }
 

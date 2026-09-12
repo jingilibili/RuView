@@ -1886,6 +1886,11 @@ struct AppStateInner {
     /// EMA of `|raw_motion - baseline_motion|`: the quiet-room jitter scale used
     /// to decide whether a motion score is presence or noise.
     motion_noise_floor: f64,
+    /// Occupancy after the dwell filter — what the API and the gate read.
+    stable_occupancy: usize,
+    /// Candidate occupancy change and when it was first seen (dwell filter).
+    occupancy_candidate: usize,
+    occupancy_candidate_since: Option<std::time::Instant>,
     // ── Vital signs smoothing ────────────────────────────────────────────
     /// EMA-smoothed heart rate (BPM).
     smoothed_hr: f64,
@@ -2280,6 +2285,37 @@ impl AppStateInner {
     /// "esp32:offline" so the UI can distinguish active vs stale connections.
     /// Person count: eigenvalue-based if field model is calibrated, else heuristic.
     /// Uses global frame_history if populated, otherwise the freshest per-node history.
+    /// Report occupancy through a dwell filter.
+    ///
+    /// `person_count_at` is a per-call estimate of a slowly changing quantity, so
+    /// its noise reaches every consumer. A change must persist for
+    /// `OCCUPANCY_DWELL_MS` before it is reported, which removes the 0 <-> 1
+    /// flicker MEASURED in a still room while still registering a person who walks
+    /// in within a couple of seconds.
+    fn observe_occupancy(&mut self, raw: usize, now: std::time::Instant) -> usize {
+        if raw == self.stable_occupancy {
+            self.occupancy_candidate = raw;
+            self.occupancy_candidate_since = None;
+            return self.stable_occupancy;
+        }
+        match self.occupancy_candidate_since {
+            Some(since)
+                if self.occupancy_candidate == raw
+                    && now.saturating_duration_since(since)
+                        >= Duration::from_millis(OCCUPANCY_DWELL_MS) =>
+            {
+                self.stable_occupancy = raw;
+                self.occupancy_candidate_since = None;
+            }
+            Some(_) if self.occupancy_candidate == raw => {}
+            _ => {
+                self.occupancy_candidate = raw;
+                self.occupancy_candidate_since = Some(now);
+            }
+        }
+        self.stable_occupancy
+    }
+
     fn person_count_at(&self, observed_at_unix_ms: u64) -> usize {
         // A persisted bootstrap model has negative-only authority. Its only
         // allowed occupancy effect is the explicit empty-background suppression
@@ -2479,6 +2515,9 @@ impl AppStateInner {
             baseline_motion: 0.0,
             baseline_frames: 0,
             motion_noise_floor: 0.0,
+            stable_occupancy: 0,
+            occupancy_candidate: 0,
+            occupancy_candidate_since: None,
             smoothed_hr: 0.0,
             smoothed_br: 0.0,
             smoothed_hr_conf: 0.0,
@@ -3654,6 +3693,12 @@ const ACTIVE_THRESHOLD: f64 = 0.25;
 /// A node's vitals are only considered for publication while its newest frame
 /// is younger than this.
 const VITALS_MAX_AGE_MS: u64 = 5_000;
+
+/// How long an occupancy change must persist before it is reported. MEASURED with
+/// a person sitting still: the eigenvalue estimate flipped between 0 and 1 every
+/// few seconds, which made vitals publication intermittent and the presence
+/// display flicker. Two seconds still registers a person walking in promptly.
+const OCCUPANCY_DWELL_MS: u64 = 2_000;
 
 /// How far apart two nodes' heart-rate estimates may be and still count as
 /// corroborating each other. MEASURED spread on this array when the estimates
@@ -6316,10 +6361,15 @@ fn derive_pose_from_sensing(update: &SensingUpdate) -> Vec<PersonDetection> {
         return vec![];
     }
 
-    // `estimated_persons` is `Some` only when the estimators found at least one
-    // person, so a missing count means nobody. Defaulting to one person here is
-    // how a presence false positive became a full 26-keypoint skeleton in an
-    // empty room — the pose must come from the count, never from the flag.
+    // A pose needs motion *and* an occupant. The count alone is not enough now: a
+    // still occupant is presence (the calibrated occupancy estimate sees them) but
+    // there is no motion to derive a pose from, and fabricating one is how an empty
+    // room ended up with a 26-keypoint skeleton. The count alone was not enough in
+    // the other direction either — defaulting to one person from a bare presence
+    // flag did the same thing.
+    if !cls.presence {
+        return vec![];
+    }
     let Some(person_count) = update.estimated_persons.filter(|count| *count > 0) else {
         return vec![];
     };
@@ -10221,8 +10271,28 @@ async fn udp_receiver_task(
                     // A restored prior can suppress a background-only raw
                     // classification. It cannot authorize positive presence.
                     let now = std::time::Instant::now();
+                    // A fresh calibration makes the occupancy estimate the
+                    // authority on how many people are present — the only signal
+                    // that sees a still occupant, and what `person_count_at`
+                    // documents ("eigenvalue-based if field model is calibrated,
+                    // else heuristic"). MEASURED with a person sitting still:
+                    // motion_level `absent` while `person_count_at` read 1, so the
+                    // published count was `None` and every UI showed an empty room.
+                    let calibrated_occupancy = if s
+                        .explicit_calibration_fresh_at(observed_at_unix_ms)
+                    {
+                        let raw_count = s.person_count_at(observed_at_unix_ms);
+                        let occupancy_now = std::time::Instant::now();
+                        Some(s.observe_occupancy(raw_count, occupancy_now))
+                    } else {
+                        None
+                    };
+
                     let total_persons = if bootstrap_empty {
                         0
+                    } else if let Some(count) = calibrated_occupancy {
+                        s.prev_person_count = count;
+                        count
                     } else if classification.presence {
                         let dedup = s.dedup_factor;
                         let (fused, fallback_count) = multistatic_bridge::fuse_or_fallback(
@@ -11967,6 +12037,9 @@ async fn main() {
         current_motion_level: "absent".to_string(),
         debounce_counter: 0,
         debounce_candidate: "absent".to_string(),
+        stable_occupancy: 0,
+        occupancy_candidate: 0,
+        occupancy_candidate_since: None,
         baseline_motion: 0.0,
         baseline_frames: 0,
         motion_noise_floor: 0.0,
