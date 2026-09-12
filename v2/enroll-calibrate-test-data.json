@@ -1392,5 +1392,114 @@
       "Phase 2: reference labels (wearable/PSG) via the ADR-293 ground-truth ingest"
     ],
     "recorded_at_unix_s": 1789235472
+  },
+  "sleep_phase0b_calibration_2026_09_12": {
+    "goal": "Phase 0 continued: run the runtime explicit calibration the vitals publication gate requires, then re-measure the gate.",
+    "evidence_class": "MEASURED",
+    "calibration": {
+      "endpoint": "POST /api/v1/calibration/start?source_node_id=3 then POST /api/v1/calibration/stop",
+      "success": true,
+      "model_id": "cal-model-a18c9a34711f5cc0283e8ede9c9ade34",
+      "source_node_ids": [
+        3
+      ],
+      "source_grid": {
+        "n_subcarriers": 192,
+        "ppdu_type": 0
+      },
+      "frames_collected": 8153,
+      "collection_rate_hz": 13.4,
+      "min_frames": 1000,
+      "min_duration_s": 600,
+      "status_after_finalize": "fresh",
+      "binding_mode": "runtime"
+    },
+    "source_selection": {
+      "first_attempt": {
+        "bound": {
+          "node": 2,
+          "grid": 192
+        },
+        "result": "3 frames in 105 s — the node switched to mostly 306-bin output right after the binding was taken from a 20 s evidence window",
+        "outcome": "reset; the window would have been wasted",
+        "fix": "pick the eligible source with the highest measured rate_hz, and add an explicit `stalled` verdict to /api/v1/calibration/status (PR #1912)"
+      },
+      "second_attempt": {
+        "bound": {
+          "node": 3,
+          "grid": 192
+        },
+        "documented_rate_hz": 21.8,
+        "result": "8153 frames at 13.4 Hz average over 600 s — finalized"
+      }
+    },
+    "vitals_gate_status_after_calibration": {
+      "explicit_calibration_fresh": true,
+      "person_count": 1,
+      "signal_quality_gate_0.40": {
+        "result": "PASS",
+        "values": {
+          "node1": 0.432,
+          "node3": 0.5
+        }
+      },
+      "heartbeat_confidence_gate_0.55": {
+        "result": "FAIL (close)",
+        "values": {
+          "node1": 0.533,
+          "node3": 0.423
+        }
+      },
+      "breathing_confidence_gate_0.55": {
+        "result": "FAIL",
+        "values": {
+          "node1": 0.378,
+          "node3": 0.239
+        }
+      },
+      "published": "abstained — vitals_for_publication publishes when EITHER metric clears its confidence threshold, so 0.533 against 0.55 is the remaining gap"
+    },
+    "raw_estimates_after_calibration": {
+      "node1": {
+        "breathing_rate_bpm": 18.71,
+        "heart_rate_bpm": 70.33,
+        "breathing_confidence": 0.378,
+        "heartbeat_confidence": 0.533,
+        "signal_quality": 0.432,
+        "accepted_sample_rate_hz": 18.0
+      },
+      "node3": {
+        "breathing_rate_bpm": 17.45,
+        "heart_rate_bpm": 90.92,
+        "breathing_confidence": 0.239,
+        "heartbeat_confidence": 0.423,
+        "signal_quality": 0.5,
+        "accepted_sample_rate_hz": 15.9
+      },
+      "note": "rates moved from 9-11 bpm (mean-amplitude series, before the fixed clock) to 17-19 bpm, which is physiologically plausible for an adult. NOT validated against any reference device — internal consistency only."
+    },
+    "presence_observation": {
+      "classification": {
+        "motion_level": "absent",
+        "presence": false
+      },
+      "estimated_persons": null,
+      "persons": 0,
+      "person_count_at": 1,
+      "interpretation": "the motion classifier reports no activity while the calibrated eigenvalue occupancy estimator reports one occupant. A still person produces exactly this pair (no motion, but a perturbed channel), so the two are not necessarily in conflict — but it also means the empty-room state during this session is unconfirmed. Requires an operator check: leave the room and compare."
+    },
+    "persistence_finding": {
+      "fact": "a finalized runtime calibration is NOT persisted; a restart returns /api/v1/calibration/status to `none` and `explicit_calibration_fresh` to false",
+      "bootstrap_path": "POST /api/v1/calibration/bootstrap/promote persists aggregate statistics, but `explicit_calibration_fresh_at` is false whenever `bootstrap_baseline_active`, so promoting closes the vitals gate instead of keeping it open",
+      "consequence": "every capture session (e.g. each night) needs its own 10-minute empty-room calibration before it starts",
+      "follow_up": "consider persisting the runtime field model with a freshness window so an overnight session can start without a fresh 10-minute collection"
+    },
+    "pull_requests": {
+      "1909": "enrollment/calibration CLI (7 files)",
+      "1911": "live-UI verification + demotion reason (5 files)",
+      "1912": "vitals fixed clock + calibration stall verdict (2 files, 2 commits)",
+      "1914": "empty-room presence honesty + pose view (6 files, stacked on #1912)"
+    },
+    "recorded_at_unix_s": 1789238233
   }
 }
