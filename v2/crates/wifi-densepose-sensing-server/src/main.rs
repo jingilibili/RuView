@@ -3651,6 +3651,11 @@ const PRESENT_MOVING_THRESHOLD: f64 = 0.12;
 /// Fixed floor of the `active` threshold.
 const ACTIVE_THRESHOLD: f64 = 0.25;
 
+/// Silence from the bound calibration source, in seconds, after which a
+/// collecting calibration is reported as stalled. At the 10-25 Hz these nodes
+/// deliver on their bound grid, five seconds of nothing means the grid is gone.
+const CALIBRATION_STALL_SECS: f64 = 5.0;
+
 /// Minimum training accuracy for the adaptive classifier to override the signal
 /// classifier. The label set, so ~0.33 is chance.
 const ADAPTIVE_MIN_ACCURACY: f64 = 0.60;
@@ -7822,6 +7827,26 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
         || "none".to_string(),
         |status| format!("{status:?}").to_lowercase(),
     );
+    // A collection bound to a grid the node stopped emitting makes no progress
+    // and burns the whole window silently: MEASURED, 3 frames in 105 s against
+    // `min_frames: 1000` / `min_duration_s: 600`. The grid is chosen from a 20 s
+    // evidence window, and these nodes interleave 192- and 306-bin frames, so the
+    // binding can be correct when taken and wrong seconds later.
+    let stall_seconds: Option<f64> = s.calibration_grid_binding.and_then(|binding| {
+        s.node_states
+            .get(&binding.source_node_id)
+            .and_then(|node| node.field_model_latest_seen)
+            .map(|seen| now.saturating_duration_since(seen).as_secs_f64())
+    });
+    let stalled = active && stall_seconds.is_some_and(|age| age > CALIBRATION_STALL_SECS);
+    // Kept out of the `json!` body below, which is already at the macro's
+    // recursion limit.
+    let stall_hint: Option<&str> = stalled.then_some(
+        "bound calibration grid is not arriving — the node moved to a different subcarrier \
+         grid. reset and start again, preferring the eligible source with the highest measured \
+         rate_hz.",
+    );
+
     let grid_binding = s.calibration_grid_binding.map(|binding| {
         let node = s.node_states.get(&binding.source_node_id);
         let latest_seen_ms = node
@@ -7839,6 +7864,48 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
             { "active" } else { "stale" },
         })
     });
+    // Extracted from the response below: the default macro recursion limit is
+    // reached by this response's nesting, so the deepest branch lives here.
+    let bootstrap_baseline_json = s
+        .bootstrap_baseline
+        .as_ref()
+        .map(|metadata| {
+            serde_json::json!({
+                "stored": true,
+                "active": bootstrap_active,
+                "authority": metadata.authority,
+                "source_node_ids": metadata.source_node_ids,
+                "source_grid": metadata.source_grid,
+                "source_model_id": metadata.source_model_id,
+                "created_at_unix_ms": metadata.created_at_unix_ms,
+                "expires_at_unix_ms": metadata.expires_at_unix_ms,
+                "content_sha256": metadata.content_sha256,
+                "background_match": bootstrap_background_match.map(|result| serde_json::json!({
+                    "state": if result.matches_empty { "matched" } else { "changed" },
+                    "matches_empty": result.matches_empty,
+                    "score": result.score,
+                    "normalized_residual_z": result.normalized_residual_z,
+                    "maturity": result.maturity,
+                    "reliable": result.reliable,
+                    "residual_energy": result.residual_energy,
+                    "residual_energy_threshold": result.residual_energy_threshold,
+                    "window_size": result.window_size,
+                    "reference_window_count": result.reference_window_count,
+                })),
+                "calibrated_evidence_authorized": false,
+                "numeric_vitals_authorized": false,
+            })
+        })
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "stored": false,
+                "active": false,
+                "authority": "none",
+                "calibrated_evidence_authorized": false,
+                "numeric_vitals_authorized": false,
+            })
+        });
+
     Json(serde_json::json!({
         "active": active,
         "status": status,
@@ -7850,6 +7917,12 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
         "model_id": s.calibration_model_id,
         "source_node_ids": s.calibration_source_node_ids,
         "grid_binding": grid_binding,
+        // Explicit stall verdict: `true` means the bound source is not feeding the
+        // collection, so finishing this run is impossible and it should be reset
+        // and started again on the highest-rate eligible source.
+        "stalled": stalled,
+        "stall_seconds": stall_seconds,
+        "stall_hint": stall_hint,
         "last_sequence_by_node": s.calibration_last_sequences,
         "sequence_policy": "forward_only_with_bounded_udp_reorder_drop_v1",
         "reorder_window_sequences": CALIBRATION_SEQUENCE_REORDER_WINDOW,
@@ -7858,37 +7931,7 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
         "sequence_fault_node_ids": s.calibration_sequence_fault_node_ids,
         "runtime_reference": runtime_reference,
         "binding_mode": if bootstrap_active { "bootstrap_only" } else if active { "runtime" } else { "none" },
-        "bootstrap_baseline": s.bootstrap_baseline.as_ref().map(|metadata| serde_json::json!({
-            "stored": true,
-            "active": bootstrap_active,
-            "authority": metadata.authority,
-            "source_node_ids": metadata.source_node_ids,
-            "source_grid": metadata.source_grid,
-            "source_model_id": metadata.source_model_id,
-            "created_at_unix_ms": metadata.created_at_unix_ms,
-            "expires_at_unix_ms": metadata.expires_at_unix_ms,
-            "content_sha256": metadata.content_sha256,
-            "background_match": bootstrap_background_match.map(|result| serde_json::json!({
-                "state": if result.matches_empty { "matched" } else { "changed" },
-                "matches_empty": result.matches_empty,
-                "score": result.score,
-                "normalized_residual_z": result.normalized_residual_z,
-                "maturity": result.maturity,
-                "reliable": result.reliable,
-                "residual_energy": result.residual_energy,
-                "residual_energy_threshold": result.residual_energy_threshold,
-                "window_size": result.window_size,
-                "reference_window_count": result.reference_window_count,
-            })),
-            "calibrated_evidence_authorized": false,
-            "numeric_vitals_authorized": false,
-        })).unwrap_or_else(|| serde_json::json!({
-            "stored": false,
-            "active": false,
-            "authority": "none",
-            "calibrated_evidence_authorized": false,
-            "numeric_vitals_authorized": false,
-        })),
+        "bootstrap_baseline": bootstrap_baseline_json,
     }))
 }
 
