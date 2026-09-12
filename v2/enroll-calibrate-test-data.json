@@ -1739,5 +1739,110 @@
       "1914": "presence + pose view + reconnect + canvas mirror (retitled and commented)"
     },
     "recorded_at_unix_s": 1789242181
+  },
+  "presence_motion_test_2026_09_13": {
+    "goal": "Second on-hardware test with a scripted timeline, to check occupancy, activity and the vitals gate.",
+    "evidence_class": "MEASURED",
+    "room_note": "room B is the operator's CATS' room. The cat is a permanent confounder there and was detected as an occupant (see below); the sleep-monitoring room is planned to be the bedroom, not room B.",
+    "timeline": {
+      "00:16-00:26": "empty-room calibration (15381 frames, node 1, 192-bin grid, finalized fresh)",
+      "00:29": "empty, verified clean",
+      "00:31": "operator enters, sits still",
+      "00:34": "operator walks around the room",
+      "00:35-00:36": "sits still again",
+      "00:37": "leaves",
+      "00:38-00:40": "empty",
+      "00:41+": "operator re-enters with a cat"
+    },
+    "occupancy_result": {
+      "verdict": "WORKS",
+      "empty_00_29": {
+        "person_raw_1": "0/29",
+        "bg_empty_true": "29/29",
+        "gate_open": "0/29"
+      },
+      "entry_00_31": {
+        "person_raw_1": "7/29",
+        "bg_empty_true": "22/29",
+        "gate_open": "2/29"
+      },
+      "sitting_00_32_33": {
+        "person_raw_1": "20/58",
+        "bg_empty_true": "38/58",
+        "gate_open": "17/58"
+      },
+      "walking_00_34": {
+        "person_raw_1": "20/29",
+        "bg_empty_true": "9/29",
+        "gate_open": "19/29"
+      },
+      "sitting_00_35_36": {
+        "person_raw_1": "51/59",
+        "bg_empty_true": "8/59",
+        "gate_open": "37/59"
+      },
+      "left_00_38_40": {
+        "person_raw_1": "3/86",
+        "bg_empty_true": "83/86",
+        "gate_open": "0/86"
+      },
+      "cat_enters_00_41": {
+        "person_raw_1": "29/34",
+        "bg_empty_true": "5/34",
+        "gate_open": "8/34"
+      },
+      "residual_energy": {
+        "empty": "4.2-13.7",
+        "occupied": "18-41",
+        "threshold": 18.6
+      },
+      "note": "entry, exit, a still occupant and even the cat are detected; the empty-room false positive is gone because a window conforming to the calibration's empty reference is reported empty whatever the eigenvalue count reads"
+    },
+    "activity_result": {
+      "verdict": "FAILS",
+      "observation": "motion_level was `absent` in all 736 samples, including the walking minute",
+      "cause_1": "the adaptive quiet-room floor absorbed the presence signal: motion_noise_floor learned 0.283 while a person was in the room, making the scaled threshold max(0.283*3, 0.04) = 0.85",
+      "cause_2": "more fundamentally the raw motion features barely respond to a walking person on this array: smoothed_motion ran 0.041-0.064 empty versus 0.010-0.061 walking, while the calibration residual energy moved 4.2-13.7 -> up to 41.1",
+      "conclusion": "the next change is not another threshold: activity must be derived from residual-energy dynamics (short-window versus long-window variation) rather than from the amplitude-jitter features, and the quiet-floor EMA must only learn from conformance-confirmed-quiet periods"
+    },
+    "vitals_result": {
+      "published_values": [
+        {
+          "t": "00:31:20",
+          "hr_bpm": 63.0,
+          "conf": 0.59
+        },
+        {
+          "t": "00:32:07",
+          "hr_bpm": 59.0,
+          "conf": 0.65
+        }
+      ],
+      "previous_session_empty_room": "71-86 bpm",
+      "conclusion": "the heart-rate VALUE remains untrustworthy without a reference sensor; the gate publish rate is ~9.5% of frames because confidence hovers at the threshold"
+    },
+    "fixes_applied_before_this_test": [
+      "the noise margin was applied twice (score and scaled thresholds) and made motion undetectable - removed from the score",
+      "runtime_background_match: the field model's empty-room conformance check now also gates a calibration collected in this process, with negative-only authority",
+      "no presence claim during baseline warm-up, plus a MOTION_NOISE_FLOOR_PRIOR of 0.03, because a zero floor collapsed the threshold onto its 0.04 fallback and an empty room reported present_still 12 s after a restart",
+      "UI: hold the last published vitals with their age instead of clearing them every frame (the gate opens on only ~9.5% of frames)"
+    ],
+    "shutdown": {
+      "reason": "the operator's cats live in room B and could damage the boards",
+      "software_stopped": "both Windows UDP forwarders, the sensing server, and the monitoring scripts",
+      "physical": "the ESP32 boards were unplugged from USB power; the firmware has no sleep command, so power is the only off switch",
+      "logs_archived": [
+        "v2/rooms/roomB/tests/presence-test-2026-09-12.log",
+        "v2/rooms/roomB/tests/motion-test-2026-09-13.log"
+      ],
+      "calibration": "lost with the process, as designed - a runtime calibration is not persisted, so the next session needs its own 10-minute collection"
+    },
+    "next_steps": [
+      "derive activity from residual-energy dynamics and gate the quiet-floor EMA on conformance-confirmed-quiet periods",
+      "contact heart-rate sensor (operator has one, not yet attached) as a real reference to validate the heart-rate value",
+      "Garmin export or manual sleep/wake times for the first labelled nights",
+      "mount the nodes out of the cats' reach before any further session in room B"
+    ],
+    "recorded_at_unix_s": 1789247757
   }
 }
