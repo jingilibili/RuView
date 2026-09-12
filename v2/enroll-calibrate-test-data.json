@@ -1664,5 +1664,80 @@
       "person_count": "1"
     },
     "recorded_at_unix_s": 1789240434
+  },
+  "sleep_phase0e_first_publication_2026_09_12": {
+    "goal": "Run the empty-room calibration the gate needs, then confirm end-to-end publication.",
+    "evidence_class": "MEASURED",
+    "calibration_run": {
+      "tool": "v2/scripts/calibrate-room.sh --yes (first use, unattended)",
+      "model_id": "cal-model-ca1e4fbfaac1cc6da65570daacf10e51",
+      "source": {
+        "node": 3,
+        "grid": 192
+      },
+      "frames": 13419,
+      "rate_hz": 21.8,
+      "duration_s": 614,
+      "finalize": "success",
+      "status_after": "fresh / runtime",
+      "stalls": 0,
+      "note": "the script's source ranking and 30 s feed verification both did their job; no wasted window this time"
+    },
+    "first_publication": {
+      "authority": "explicit_calibration",
+      "observed_at": "23:10:53 - 23:11:14 local",
+      "windows": 4,
+      "published": {
+        "breathing_rate_bpm": [
+          12.48,
+          12.2
+        ],
+        "breathing_confidence": [
+          0.626,
+          0.648,
+          0.695
+        ],
+        "signal_quality": 0.5
+      },
+      "heart_rate_bpm": null,
+      "heart_rate_withheld_because": "the reporters contradicted each other at those instants (heartbeat_confidence 0.0 after corroboration), which is the agreement gate working",
+      "prerequisite_conditions": {
+        "explicit_calibration_fresh": true,
+        "signal_quality": "0.50 >= 0.40",
+        "breathing_confidence": "0.61-0.70 >= 0.55",
+        "occupancy": "person_count_at flips between 0 and 1 with nobody moving; publication happened in the windows where it read 1"
+      }
+    },
+    "gate_behaviour_while_empty": {
+      "observed": "authority abstained with person_count 0 while the room was empty, and the diagnostics showed every other condition green (fresh=True, q=0.50, br conf up to 0.69, hr conf up to 0.73)",
+      "reading": "the gate withholds correctly for an empty room rather than publishing a rate for nobody",
+      "resolves_earlier_ambiguity": "the earlier person_count=1 in an empty-looking room was the operator being in the room after the calibration, not an occupancy false positive"
+    },
+    "occupancy_stability_issue": {
+      "observed": "person_count_at flips 0 <-> 1 over tens of seconds with nobody moving (motion_level stays absent throughout)",
+      "impact": "publication is therefore intermittent even when all other conditions hold, and a sleep session would see gaps",
+      "next_step": "add hysteresis to the occupancy estimate (enter/exit thresholds or a dwell time) and measure it against a known empty room and a known still person"
+    },
+    "ui_defects_found_by_testing": [
+      {
+        "id": "canvas_text_mirrored",
+        "where": "ui/pose-fusion/js/main.js drawNoPose, against .video-panel canvas { transform: scaleX(-1) } in pose-fusion/css/style.css",
+        "symptom": "the EMPTY / NO PRESENCE label in the CSI-only window rendered reversed",
+        "fix": "pre-mirror the context so the two mirrors cancel; setTransform first so no earlier transform is inherited",
+        "verified": "onscreen alpha column profile vs an unmirrored reference: 0.812 plain vs 0.998 flipped -> the buffer is pre-mirrored"
+      },
+      {
+        "id": "no_reconnect",
+        "where": "ui/pose-fusion/js/csi-simulator.js and ui/observatory/js/main.js",
+        "symptom": "a page left open across a server restart stayed in the watermarked demo view until reloaded — the likely cause of the 'tested it and it did not work' report, since the server was restarted many times",
+        "ruled_out": "browser caching: the server sends cache-control: no-cache, no-store, must-revalidate for /ui/*",
+        "fix": "shared ui/services/ws-reconnect.js with exponential backoff (1 s doubling to 15 s), reset on a verified frame, demo fallback only after RECONNECT_MAX_FAILURES",
+        "verified": "closing each page's own socket over CDP: pose-fusion back to LIVE CSI in 3 s; observatory ws null at t+3s then reconnected at t+6s"
+      }
+    ],
+    "pull_requests": {
+      "1914": "presence + pose view + reconnect + canvas mirror (retitled and commented)"
+    },
+    "recorded_at_unix_s": 1789242181
   }
 }
