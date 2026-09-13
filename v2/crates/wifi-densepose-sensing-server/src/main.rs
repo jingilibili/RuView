@@ -79,7 +79,7 @@ use tracing::{debug, error, info, warn};
 
 use rvf_container::{RvfBuilder, RvfContainerInfo, RvfReader, VitalSignConfig};
 use rvf_pipeline::ProgressiveLoader;
-use vital_signs::{VitalSignDetector, VitalSigns};
+use vital_signs::{SpectralEvidence, VitalSignDetector, VitalSigns};
 
 // ADR-022 Phase 3: Multi-BSSID pipeline integration
 #[cfg(not(target_os = "macos"))]
@@ -1970,6 +1970,10 @@ struct AppStateInner {
     engine_bridge: engine_bridge::EngineBridge,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
     field_model: Option<FieldModel>,
+    /// Spectral evidence gathered during the current empty-room collection.
+    vitals_null: VitalsNullCollector,
+    /// Per-node evidence summary from the last completed calibration.
+    vitals_null_floors: HashMap<u8, VitalsNullFloor>,
     /// Stable installation identity used only to bind local persisted state.
     installation_id: Option<String>,
     /// Metadata for the privacy reduced empty room image, when available.
@@ -2135,6 +2139,15 @@ impl AppStateInner {
     /// Admit at most one raw CSI observation per forward node sequence into
     /// the current calibration session. This stateful boundary prevents a
     /// caller from advancing the model with a replayed history tail.
+    /// Summarize the spectral evidence gathered during the empty hold. Called
+    /// when a collection finalizes: the summary is what this room's own noise
+    /// looks like on each node, which is what a runtime estimate has to beat
+    /// before a fixed confidence threshold can mean anything.
+    fn finish_vitals_null_floors(&mut self) {
+        self.vitals_null_floors = self.vitals_null.summarize();
+        self.vitals_null.clear();
+    }
+
     fn maybe_feed_calibration_frame(
         &mut self,
         node_id: u8,
@@ -2204,6 +2217,16 @@ impl AppStateInner {
             if let Some(node) = self.node_states.get_mut(&node_id) {
                 node.push_field_model_frame(sequence, amplitudes, observed_at);
             }
+            // The operator holds the room empty for this whole window, so
+            // whatever the vital bands show now is this room's own noise. The
+            // evidence is read from the node that owns the detector, so it
+            // always belongs to the same estimates that node reports.
+            let evidence = self
+                .node_states
+                .get(&node_id)
+                .map(|node| node.vital_detector.last_evidence())
+                .unwrap_or_default();
+            self.vitals_null.observe(node_id, evidence);
         }
         accepted
     }
@@ -6228,6 +6251,94 @@ fn assess_legacy_image_pose(state: &mut AppStateInner, update: &SensingUpdate) {
 /// evidence for that metric, restricted to nodes whose newest frame is fresh.
 /// Returns `None` when no fresh node reports either metric, so the caller can
 /// keep the frame-local value.
+/// Per-node breathing and heartbeat band evidence measured while an
+/// explicit calibration held the room empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct VitalsNullFloor {
+    samples: usize,
+    breathing_p50: f64,
+    breathing_p95: f64,
+    heartbeat_p50: f64,
+    heartbeat_p95: f64,
+}
+
+/// Bounded so a long collection cannot grow without limit; the hold lasts
+/// minutes at tens of frames per second.
+const VITALS_NULL_MAX_SAMPLES: usize = 40_000;
+/// Fewer samples than this and no summary is published for that node.
+const VITALS_NULL_MIN_SAMPLES: usize = 60;
+/// The ratio a real occupant has to beat, per node, in the same units.
+const VITALS_NULL_PERCENTILE: usize = 95;
+
+fn percentile_of(values: &mut [f64], percentile: usize) -> Option<f64> {
+    if values.is_empty() || percentile == 0 || percentile > 100 {
+        return None;
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let index = values
+        .len()
+        .saturating_mul(percentile)
+        .div_ceil(100)
+        .saturating_sub(1);
+    values.get(index).copied()
+}
+
+/// Gathers the spectral evidence of every node while the room is held empty.
+#[derive(Debug, Clone, Default)]
+struct VitalsNullCollector {
+    samples: HashMap<u8, Vec<SpectralEvidence>>,
+}
+
+impl VitalsNullCollector {
+    fn observe(&mut self, node_id: u8, evidence: SpectralEvidence) {
+        if !evidence.breathing_peak_ratio.is_finite()
+            || !evidence.heartbeat_peak_ratio.is_finite()
+        {
+            return;
+        }
+        let entry = self.samples.entry(node_id).or_default();
+        if entry.len() < VITALS_NULL_MAX_SAMPLES {
+            entry.push(evidence);
+        }
+    }
+
+    fn summarize(&self) -> HashMap<u8, VitalsNullFloor> {
+        let mut out = HashMap::new();
+        for (node_id, samples) in &self.samples {
+            if samples.len() < VITALS_NULL_MIN_SAMPLES {
+                continue;
+            }
+            let mut breathing: Vec<f64> = samples
+                .iter()
+                .map(|evidence| evidence.breathing_peak_ratio)
+                .collect();
+            let mut heartbeat: Vec<f64> = samples
+                .iter()
+                .map(|evidence| evidence.heartbeat_peak_ratio)
+                .collect();
+            let breathing_p50 = percentile_of(&mut breathing, 50).unwrap_or(0.0);
+            let heartbeat_p50 = percentile_of(&mut heartbeat, 50).unwrap_or(0.0);
+            out.insert(
+                *node_id,
+                VitalsNullFloor {
+                    samples: samples.len(),
+                    breathing_p50,
+                    breathing_p95: percentile_of(&mut breathing, VITALS_NULL_PERCENTILE)
+                        .unwrap_or(0.0),
+                    heartbeat_p50,
+                    heartbeat_p95: percentile_of(&mut heartbeat, VITALS_NULL_PERCENTILE)
+                        .unwrap_or(0.0),
+                },
+            );
+        }
+        out
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
+    }
+}
+
 fn best_vitals_across_nodes(nodes: &HashMap<u8, NodeState>) -> Option<VitalSigns> {
     let now = std::time::Instant::now();
     let max_age = Duration::from_millis(VITALS_MAX_AGE_MS);
@@ -8103,6 +8214,7 @@ async fn calibration_stop(State(state): State<SharedState>) -> Json<serde_json::
                 let variance_explained = modes.variance_explained;
                 let holdout_window_size = modes.baseline_runtime_window_size;
                 let final_frame_count = fm.calibration_frame_count();
+                s.finish_vitals_null_floors();
                 s.begin_field_model_holdout(binding);
                 info!("Field model calibrated: baseline_eigenvalues={baseline}, variance_explained={variance_explained:.2}");
                 Json(serde_json::json!({
@@ -8163,6 +8275,20 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
             "raw_calibration_frames_persisted": false,
         }))
     });
+    let vitals_null_floors: Vec<serde_json::Value> = s
+        .vitals_null_floors
+        .iter()
+        .map(|(node_id, floor)| {
+            serde_json::json!({
+                "node_id": node_id,
+                "samples": floor.samples,
+                "breathing_p50_ratio": floor.breathing_p50,
+                "breathing_p95_ratio": floor.breathing_p95,
+                "heartbeat_p50_ratio": floor.heartbeat_p50,
+                "heartbeat_p95_ratio": floor.heartbeat_p95,
+            })
+        })
+        .collect();
     let (frame_count, min_frames, elapsed_s, frames_per_second, min_duration_s) = s
         .field_model
         .as_ref()
@@ -8282,6 +8408,7 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
         "max_reorder_depth_by_node": s.calibration_max_reorder_depth,
         "sequence_fault_node_ids": s.calibration_sequence_fault_node_ids,
         "runtime_reference": runtime_reference,
+        "vitals_null_floor": vitals_null_floors,
         "binding_mode": if bootstrap_active { "bootstrap_only" } else if active { "runtime" } else { "none" },
         "bootstrap_baseline": bootstrap_baseline_json,
     }))
@@ -8852,6 +8979,8 @@ async fn calibration_reset(State(state): State<SharedState>) -> Json<serde_json:
     let mut s = state.write().await;
     s.field_model = None;
     s.calibration_model_id = None;
+    s.vitals_null.clear();
+    s.vitals_null_floors.clear();
     s.calibration_source_node_ids.clear();
     s.clear_field_model_binding();
     s.clear_calibration_sequence_state();
@@ -9034,6 +9163,22 @@ async fn vital_signs_diagnostics_endpoint(
             "node_id": node_id,
             "csi_fps_ema": node.csi_fps_ema,
             "accepted_sample_rate_hz": node.effective_accepted_sample_rate_hz(),
+            "breathing_peak_ratio": node.vital_detector.last_evidence().breathing_peak_ratio,
+            "heartbeat_peak_ratio": node.vital_detector.last_evidence().heartbeat_peak_ratio,
+            "null_breathing_p95_ratio": s.vitals_null_floors.get(&node_id).map(|floor| floor.breathing_p95),
+            "null_heartbeat_p95_ratio": s.vitals_null_floors.get(&node_id).map(|floor| floor.heartbeat_p95),
+            "breathing_ratio_over_null": s.vitals_null_floors.get(&node_id).and_then(|floor| {
+                (floor.breathing_p95 > f64::EPSILON).then_some(
+                    node.vital_detector.last_evidence().breathing_peak_ratio
+                        / floor.breathing_p95,
+                )
+            }),
+            "heartbeat_ratio_over_null": s.vitals_null_floors.get(&node_id).and_then(|floor| {
+                (floor.heartbeat_p95 > f64::EPSILON).then_some(
+                    node.vital_detector.last_evidence().heartbeat_peak_ratio
+                        / floor.heartbeat_p95,
+                )
+            }),
             "current_motion_level": node.current_motion_level,
             "baseline_motion": node.baseline_motion,
             "smoothed_motion": node.smoothed_motion,
@@ -12113,6 +12258,11 @@ async fn main() {
     let mut engine_bridge_multistatic_cfg: Option<MultistaticConfig> = None;
     let mut node_positions_config: HashMap<u8, [f32; 3]> = HashMap::new();
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
+        // Empty-room vitals noise: gathered while a calibration holds the
+        // room empty, summarized when that collection finalizes
+        // (see VitalsNullCollector).
+        vitals_null: VitalsNullCollector::default(),
+        vitals_null_floors: HashMap::new(),
         latest_update: None,
         rssi_history: VecDeque::new(),
         frame_history: VecDeque::new(),

@@ -33,6 +33,26 @@ const CONFIDENCE_THRESHOLD: f64 = 2.0;
 
 // ── Output types ───────────────────────────────────────────────────────────
 
+/// Raw spectral evidence behind the latest breathing and heartbeat
+/// estimates.
+///
+/// The 0-1 confidence in [`VitalSigns`] is a fixed monotone map of these
+/// ratios (`CONFIDENCE_THRESHOLD`), so it cannot express "this peak is no
+/// stronger than this room's own noise". MEASURED on a three node
+/// ESP32-S3 rig: mean breathing confidence was 0.425 / 0.451 / 0.469 per
+/// node in a verified empty room and 0.421 / 0.454 / 0.506 with a person
+/// sitting still on the floor, and node 3 crossed the 0.55 publication
+/// threshold in 20 percent of the *empty* samples. An empty-room
+/// calibration records this ratio per node so a runtime estimate has
+/// something honest to be compared against.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpectralEvidence {
+    /// Peak power over band mean power in the breathing band.
+    pub breathing_peak_ratio: f64,
+    /// Peak power over band mean power in the heartbeat band.
+    pub heartbeat_peak_ratio: f64,
+}
+
 /// Vital sign readings produced each frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VitalSigns {
@@ -92,6 +112,9 @@ pub struct VitalSignDetector {
     heartbeat_capacity: usize,
     /// Running frame count for signal quality estimation.
     frame_count: u64,
+    /// Spectral evidence behind the latest estimates, exported so an
+    /// empty-room calibration can record this room's own band noise.
+    last_evidence: SpectralEvidence,
 }
 
 impl VitalSignDetector {
@@ -129,6 +152,7 @@ impl VitalSignDetector {
             breathing_capacity: breathing_capacity.max(1),
             heartbeat_capacity: heartbeat_capacity.max(1),
             frame_count: 0,
+            last_evidence: SpectralEvidence::default(),
         }
     }
 
@@ -193,8 +217,14 @@ impl VitalSignDetector {
         }
 
         // -- Extract vital signs --
-        let (breathing_rate, breathing_confidence) = self.extract_breathing();
-        let (heart_rate, heartbeat_confidence) = self.extract_heartbeat();
+        let (breathing_rate, breathing_confidence, breathing_ratio) =
+            self.extract_breathing_with_ratio();
+        let (heart_rate, heartbeat_confidence, heartbeat_ratio) =
+            self.extract_heartbeat_with_ratio();
+        self.last_evidence = SpectralEvidence {
+            breathing_peak_ratio: breathing_ratio,
+            heartbeat_peak_ratio: heartbeat_ratio,
+        };
 
         // -- Signal quality --
         let signal_quality = self.compute_signal_quality(amplitude);
@@ -211,32 +241,56 @@ impl VitalSignDetector {
     /// Extract breathing rate from the breathing buffer via FFT.
     /// Returns (rate_bpm, confidence).
     pub fn extract_breathing(&self) -> (Option<f64>, f64) {
+        let (rate, confidence, _) = self.extract_breathing_with_ratio();
+        (rate, confidence)
+    }
+
+    /// Breathing estimate together with the raw peak-to-band-mean ratio.
+    pub fn extract_breathing_with_ratio(&self) -> (Option<f64>, f64, f64) {
         if self.breathing_buffer.len() < MIN_BREATHING_SAMPLES {
-            return (None, 0.0);
+            return (None, 0.0, 0.0);
         }
 
         let data: Vec<f64> = self.breathing_buffer.iter().copied().collect();
         let filtered = bandpass_filter(&data, BREATHING_MIN_HZ, BREATHING_MAX_HZ, self.sample_rate);
-        self.compute_fft_peak(&filtered, BREATHING_MIN_HZ, BREATHING_MAX_HZ)
+        self.compute_fft_peak_with_ratio(&filtered, BREATHING_MIN_HZ, BREATHING_MAX_HZ)
     }
 
     /// Extract heart rate from the heartbeat buffer via FFT.
     /// Returns (rate_bpm, confidence).
     pub fn extract_heartbeat(&self) -> (Option<f64>, f64) {
+        let (rate, confidence, _) = self.extract_heartbeat_with_ratio();
+        (rate, confidence)
+    }
+
+    /// Heartbeat estimate together with the raw peak-to-band-mean ratio.
+    pub fn extract_heartbeat_with_ratio(&self) -> (Option<f64>, f64, f64) {
         if self.heartbeat_buffer.len() < MIN_HEARTBEAT_SAMPLES {
-            return (None, 0.0);
+            return (None, 0.0, 0.0);
         }
 
         let data: Vec<f64> = self.heartbeat_buffer.iter().copied().collect();
         let filtered = bandpass_filter(&data, HEARTBEAT_MIN_HZ, HEARTBEAT_MAX_HZ, self.sample_rate);
-        self.compute_fft_peak(&filtered, HEARTBEAT_MIN_HZ, HEARTBEAT_MAX_HZ)
+        self.compute_fft_peak_with_ratio(&filtered, HEARTBEAT_MIN_HZ, HEARTBEAT_MAX_HZ)
     }
 
     /// Find the dominant frequency in `buffer` within the [min_hz, max_hz] band
     /// using FFT. Returns (frequency_as_bpm, confidence).
     pub fn compute_fft_peak(&self, buffer: &[f64], min_hz: f64, max_hz: f64) -> (Option<f64>, f64) {
+        let (rate, confidence, _) = self.compute_fft_peak_with_ratio(buffer, min_hz, max_hz);
+        (rate, confidence)
+    }
+
+    /// Same peak search, also returning the raw `peak_mag / band_mean` ratio
+    /// that the confidence is derived from.
+    pub fn compute_fft_peak_with_ratio(
+        &self,
+        buffer: &[f64],
+        min_hz: f64,
+        max_hz: f64,
+    ) -> (Option<f64>, f64, f64) {
         if buffer.len() < 4 {
-            return (None, 0.0);
+            return (None, 0.0, 0.0);
         }
 
         // Zero-pad to next power of two for radix-2 FFT
@@ -262,7 +316,7 @@ impl VitalSignDetector {
         let max_bin = ((max_hz / freq_res).floor() as usize).min(spectrum.len().saturating_sub(1));
 
         if min_bin >= max_bin || min_bin >= spectrum.len() {
-            return (None, 0.0);
+            return (None, 0.0, 0.0);
         }
 
         // Find peak magnitude and its bin index within the band
@@ -283,7 +337,7 @@ impl VitalSignDetector {
         }
 
         if band_count == 0 || band_sum < f64::EPSILON {
-            return (None, 0.0);
+            return (None, 0.0, 0.0);
         }
 
         let band_mean = band_sum / band_count as f64;
@@ -321,10 +375,15 @@ impl VitalSignDetector {
         };
 
         if confidence > 0.05 {
-            (Some(bpm), confidence)
+            (Some(bpm), confidence, peak_ratio)
         } else {
-            (None, confidence)
+            (None, confidence, peak_ratio)
         }
+    }
+
+    /// Spectral evidence behind the latest [`Self::process_frame`] call.
+    pub fn last_evidence(&self) -> SpectralEvidence {
+        self.last_evidence
     }
 
     /// Overall signal quality based on amplitude statistics.
@@ -699,6 +758,34 @@ pub fn run_benchmark(n_frames: usize) -> (std::time::Duration, std::time::Durati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The empty-room calibration records this ratio, so it has to be exposed
+    /// and it has to be above the fixed confidence threshold for a tone that is
+    /// unambiguously inside the breathing band.
+    #[test]
+    fn spectral_evidence_exposes_the_raw_peak_ratio() {
+        let mut detector = VitalSignDetector::new(10.0);
+        for index in 0..900 {
+            let t = index as f64 / 10.0;
+            let amplitude = vec![10.0 + (2.0 * PI * 0.25 * t).sin(); 8];
+            let phase: Vec<f64> = (0..8)
+                .map(|subcarrier| {
+                    (2.0 * PI * 1.3 * t).sin() * 0.2 + subcarrier as f64 * 0.3
+                })
+                .collect();
+            detector.process_frame(&amplitude, &phase);
+        }
+        let vitals = detector.process_frame(&vec![10.0; 8], &vec![0.0; 8]);
+        let evidence = detector.last_evidence();
+        assert!(
+            evidence.breathing_peak_ratio > CONFIDENCE_THRESHOLD,
+            "a clean 0.25 Hz tone must clear the confidence threshold: {evidence:?}"
+        );
+        assert!(
+            vitals.breathing_confidence > 0.5,
+            "matching confidence expected: {vitals:?}"
+        );
+    }
 
     /// Regression test for the linear-vs-circular phase variance bug.
     ///
