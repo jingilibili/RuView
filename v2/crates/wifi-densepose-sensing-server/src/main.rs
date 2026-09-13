@@ -2327,11 +2327,19 @@ impl AppStateInner {
             self.occupancy_candidate_since = None;
             return self.stable_occupancy;
         }
+        // Lowering the reported count is a release: it needs the longer
+        // hold so a still occupant is not dropped between boundary
+        // crossings. Raising it stays responsive.
+        let hold_ms = if raw < self.stable_occupancy {
+            OCCUPANCY_RELEASE_MS
+        } else {
+            OCCUPANCY_DWELL_MS
+        };
         match self.occupancy_candidate_since {
             Some(since)
                 if self.occupancy_candidate == raw
                     && now.saturating_duration_since(since)
-                        >= Duration::from_millis(OCCUPANCY_DWELL_MS) =>
+                        >= Duration::from_millis(hold_ms) =>
             {
                 self.stable_occupancy = raw;
                 self.occupancy_candidate_since = None;
@@ -3734,6 +3742,17 @@ const MOTION_NOISE_FLOOR_PRIOR: f64 = 0.03;
 /// few seconds, which made vitals publication intermittent and the presence
 /// display flicker. Two seconds still registers a person walking in promptly.
 const OCCUPANCY_DWELL_MS: u64 = 2_000;
+/// Releasing a reported occupant is deliberately slower than acquiring
+/// one. A person sitting still does not hold a steady above-boundary
+/// residual: MEASURED on the room B rig, a motionless occupant on the
+/// floor dropped back below the empty-room boundary in bursts of about
+/// six seconds, because the residual is driven by small posture and
+/// ambient traffic changes rather than by a constant shadow. With the
+/// symmetric dwell those bursts released the occupant for a few seconds
+/// and the ADR-021 gate, which requires exactly one occupant, closed
+/// again mid-session. Entry keeps the fast path so someone walking in is
+/// still registered within a couple of seconds.
+const OCCUPANCY_RELEASE_MS: u64 = 12_000;
 
 /// How far apart two nodes' heart-rate estimates may be and still count as
 /// corroborating each other. MEASURED spread on this array when the estimates
@@ -8120,11 +8139,26 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
     let bootstrap_active = s.bootstrap_baseline_active_at(observed_at_unix_ms);
     let bootstrap_background_match = s.bootstrap_background_match(observed_at_unix_ms);
     let runtime_reference = s.field_model.as_ref().and_then(|model| {
-        model.modes().map(|modes| serde_json::json!({
+        let modes = model.modes()?;
+        // The stored boundary is a 95th percentile of the calibration
+        // windows, so a disturbance during calibration lifts it above the
+        // settled empty level. Both values and the robust reference
+        // statistics are reported so an operator can see that immediately
+        // instead of debugging an invisible occupant.
+        let stats = model.empty_room_reference_stats();
+        Some(serde_json::json!({
             "window_size": modes.baseline_runtime_window_size,
             "significant_eigenvalue_p95": modes.baseline_runtime_eigenvalue_count,
             "residual_energy_threshold": modes.empty_room_residual_energy_threshold,
+            "residual_energy_threshold_effective": model.effective_empty_room_threshold(),
             "residual_reference_window_count": modes.empty_room_residual_energy_reference.len(),
+            "residual_reference_p25": stats.map(|stats| stats.p25),
+        "residual_reference_p50": stats.map(|stats| stats.median),
+            "residual_reference_p75": stats.map(|stats| stats.p75),
+            "residual_reference_p95": stats.map(|stats| stats.p95),
+            "residual_reference_robust_scale": stats.map(|stats| stats.robust_scale),
+            "residual_reference_contamination_ratio": stats.map(|stats| stats.contamination_ratio),
+            "residual_reference_contaminated": stats.map(|stats| stats.contaminated),
             "residual_refinement_count": modes.empty_room_residual_refinement_count,
             "raw_calibration_frames_persisted": false,
         }))
@@ -9031,6 +9065,10 @@ async fn vital_signs_diagnostics_endpoint(
                 "maturity": m.maturity,
                 "residual_energy": m.residual_energy,
                 "residual_energy_threshold": m.residual_energy_threshold,
+                "residual_energy_threshold_stored": m.stored_residual_energy_threshold,
+                "reference_p50": m.reference_p50,
+                "reference_robust_scale": m.reference_robust_scale,
+                "reference_contaminated": m.reference_contaminated,
                 "normalized_residual_z": m.normalized_residual_z,
                 "window_size": m.window_size,
                 "reference_window_count": m.reference_window_count,
