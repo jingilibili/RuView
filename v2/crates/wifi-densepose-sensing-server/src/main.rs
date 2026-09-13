@@ -2156,6 +2156,24 @@ impl AppStateInner {
         amplitudes: &[f64],
         observed_at: std::time::Instant,
     ) -> bool {
+        // The operator holds the room empty for the whole collection, so
+        // whatever the vital bands show on any node is this room's own noise.
+        // Sampled ahead of the binding check so every node gets a null, not
+        // only the one whose grid the model binds.
+        if self.field_model.as_ref().is_some_and(|field| {
+            matches!(
+                field.status(),
+                CalibrationStatus::Uncalibrated | CalibrationStatus::Collecting
+            )
+        }) {
+            let evidence = self
+                .node_states
+                .get(&node_id)
+                .map(|node| node.vital_detector.last_evidence())
+                .unwrap_or_default();
+            self.vitals_null.observe(node_id, evidence);
+        }
+
         let binding_matches = self.calibration_grid_binding.is_some_and(|binding| {
             binding.source_node_id == node_id && binding.grid == grid
         });
@@ -2217,16 +2235,8 @@ impl AppStateInner {
             if let Some(node) = self.node_states.get_mut(&node_id) {
                 node.push_field_model_frame(sequence, amplitudes, observed_at);
             }
-            // The operator holds the room empty for this whole window, so
-            // whatever the vital bands show now is this room's own noise. The
-            // evidence is read from the node that owns the detector, so it
-            // always belongs to the same estimates that node reports.
-            let evidence = self
-                .node_states
-                .get(&node_id)
-                .map(|node| node.vital_detector.last_evidence())
-                .unwrap_or_default();
-            self.vitals_null.observe(node_id, evidence);
+            // Evidence for this node was already sampled above the binding
+            // check, so every node in the array gets its own noise floor.
         }
         accepted
     }
@@ -8123,6 +8133,48 @@ async fn calibration_start(
     }
 }
 
+/// Read-only view of which node and grid pairs a calibration could bind.
+///
+/// `calibration_start` answers the same question as a side effect: with
+/// exactly one eligible source it begins a ten minute collection. Using it
+/// as a probe therefore starts one silently, which happened on this rig and
+/// wasted a window that had the operator inside the room. This route never
+/// mutates state, so an operator or a script can check readiness freely.
+async fn calibration_eligibility(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let mut eligible_sources = Vec::new();
+    let mut nodes = Vec::new();
+    for (&node_id, node) in s.node_states.iter() {
+        if let Some((grid, evidence)) = node.select_calibration_grid(now) {
+            eligible_sources.push(serde_json::json!({
+                "source_node_id": node_id,
+                "grid": grid,
+                "evidence": evidence,
+            }));
+        }
+        nodes.push(serde_json::json!({
+            "node_id": node_id,
+            "candidates": node
+                .calibration_grid_candidates(now)
+                .into_iter()
+                .map(|(grid, evidence)| serde_json::json!({
+                    "grid": grid,
+                    "evidence": evidence,
+                }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    Json(serde_json::json!({
+        "success": true,
+        "eligible_source_count": eligible_sources.len(),
+        "eligible_sources": eligible_sources,
+        "nodes": nodes,
+        "frame_count": s.field_model.as_ref().map(|model| model.calibration_frame_count()),
+        "note": "read-only: this route never starts a collection",
+    }))
+}
+
 async fn calibration_stop(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let mut s = state.write().await;
     let model_id = s.calibration_model_id.clone();
@@ -12727,6 +12779,7 @@ async fn main() {
         .route("/api/v1/adaptive/unload", post(adaptive_unload))
         // Field model calibration (eigenvalue-based person counting)
         .route("/api/v1/calibration/start", post(calibration_start))
+        .route("/api/v1/calibration/eligibility", get(calibration_eligibility))
         .route("/api/v1/calibration/stop", post(calibration_stop))
         .route(
             "/api/v1/calibration/bootstrap/promote",
