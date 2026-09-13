@@ -1844,5 +1844,46 @@
       "mount the nodes out of the cats' reach before any further session in room B"
     ],
     "recorded_at_unix_s": 1789247757
+  },
+  "agc_measurement_2026_09_13": {
+    "question": "Upstream issue #1804 reports the receiver AGC rescaling CSI in discrete gain steps (per-frame mean amplitude 10..290 within one node at constant RSSI). Is that what suppresses our motion features too?",
+    "evidence_class": "MEASURED",
+    "method": "9 minutes, empty room, 91555 frames sampled from the live WebSocket at ~170 frames/s aggregate; per frame and per node: mean/min/max of the published amplitude vector, that node's RSSI, and the frame-to-frame mean-amplitude ratio",
+    "result": {
+      "node1": {
+        "mean_amplitude": "6.77 .. 8.03 .. 8.89",
+        "rssi_span_db": 2.0,
+        "ratio_p05_p50_p95": "0.931 / 1.000 / 1.074",
+        "steps_over_20pct": "2 (0.0%)"
+      },
+      "node2": {
+        "mean_amplitude": "5.00 .. 6.05 .. 7.09",
+        "rssi_span_db": 2.0,
+        "ratio_p05_p50_p95": "0.904 / 1.000 / 1.108",
+        "steps_over_20pct": "404 (1.3%)"
+      },
+      "node3": {
+        "mean_amplitude": "6.51 .. 7.06 .. 8.20",
+        "rssi_span_db": 24.0,
+        "ratio_p05_p50_p95": "0.960 / 1.000 / 1.041",
+        "steps_over_20pct": "0 (0.0%)"
+      }
+    },
+    "conclusion": "AGC is NOT the dominant problem on this array: the amplitude scale is stable to within ~1.4x and frame-to-frame ratios sit on 1.0, unlike the 29x swing reported upstream. The motion features are therefore suppressed by something else, which the same session identified: smoothed motion ran 0.041-0.064 empty versus 0.010-0.061 walking (no separation), while the calibration residual energy moved 3-4x (4.2-13.7 -> 18-41).",
+    "secondary_observations": {
+      "node2_large_steps": "404 frame pairs (1.3%) move more than 20%, the only node with such steps",
+      "node3_rssi_swing": "24 dB RSSI span while its amplitude stays within 1.26x - a propagation or association change, not a gain change; worth watching on that node"
+    },
+    "next_approach": [
+      "derive activity from residual-energy dynamics (short-window versus long-window variation) instead of amplitude-jitter features",
+      "gate the quiet-floor EMA on conformance-confirmed-quiet periods, because it currently absorbs presence (it learned 0.283 while a person was in the room, raising the threshold to 0.85)"
+    ],
+    "review_regressions_fixed": {
+      "stale_numeric_vitals": "ui/services/vitals-view.js - a value is current only while its own frame held authority and it is at most 2 s old; when authority closes the numeric fields are cleared and the last value is downgraded to an explicit historical line; nothing past 120 s",
+      "reconnect_after_manual_disconnect": "ws-reconnect.js carries _reconnectSuppressed; suppressReconnect() on a deliberate disconnect, allowReconnect() on every explicit connect",
+      "tests": "ui/services/vitals-view.test.mjs (8 cases) and ui/services/ws-reconnect.test.mjs (6 cases); node is not installed on this workstation, so the same assertions were executed against the same modules in headless Chrome: 14/14 PASS",
+      "ci_registration": "BLOCKED: the test files must be added to the explicit node --test line in .github/workflows/ci.yml, but the push is refused because the token lacks the workflow scope"
+    },
+    "recorded_at_unix_s": 1789292051
   }
 }
