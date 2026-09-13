@@ -1,15 +1,10 @@
-// Reconnect instead of dropping to demo.
+// Add manual-disconnect suppression to the shared reconnect state machine.
 //
-// A server restart used to leave an open page in the watermarked demo view until
-// the operator reloaded it: both pages connected exactly once and treated
-// `onclose` as "no live data". Sensor restarts, `cargo run` cycles and Wi-Fi
-// hiccups are normal during a deployment, so both pages now retry with backoff
-// and only fall back to demo once the link has been down long enough that the
-// last verified frame is no longer a fair representation.
-//
-// The fallback after MAX_FAILURES keeps the ADR-295 watermark honest: a page that
-// has been disconnected for tens of seconds must not keep showing a live frame as
-// if it were current.
+// Reviewer objection on the live-view PR: "explicit disconnect can immediately
+// schedule reconnection again". The cause: the page's disconnect() closed the
+// socket, closing fired onclose, and onclose called scheduleReconnect
+// unconditionally. Suppression is a property of the shared state so both page
+// controllers get it from one place.
 
 export const RECONNECT_BASE_MS = 1000;
 export const RECONNECT_MAX_MS = 15000;
@@ -21,12 +16,32 @@ export function reconnectState() {
     _reconnectTimer: null,
     _reconnectDelay: RECONNECT_BASE_MS,
     _reconnectFailures: 0,
+    // True after a deliberate disconnect: closing the socket fires onclose, and
+    // without this flag that handler would schedule a retry for a link the operator
+    // asked to close.
+    _reconnectSuppressed: false,
   };
+}
+
+/** Is reconnection suppressed by a manual disconnect? */
+export function isReconnectSuppressed(state) {
+  return state._reconnectSuppressed === true;
+}
+
+/** A deliberate disconnect: cancel anything pending and refuse further retries. */
+export function suppressReconnect(state) {
+  cancelReconnect(state);
+  state._reconnectSuppressed = true;
+}
+
+/** An explicit connect: retries are allowed again. */
+export function allowReconnect(state) {
+  state._reconnectSuppressed = false;
 }
 
 /** Schedule one reconnect attempt, with exponential backoff. */
 export function scheduleReconnect(state, attempt, onGiveUp) {
-  if (state._reconnectTimer) return;
+  if (state._reconnectSuppressed || state._reconnectTimer) return;
   const delay = state._reconnectDelay;
   state._reconnectTimer = setTimeout(() => {
     state._reconnectTimer = null;

@@ -8,7 +8,8 @@
  * matching the ADR-018 frame format expectations.
  */
 
-import { reconnectState, scheduleReconnect, cancelReconnect, reconnectSucceeded }
+import { reconnectState, scheduleReconnect, cancelReconnect, reconnectSucceeded,
+         suppressReconnect, allowReconnect }
   from '../../services/ws-reconnect.js';
 
 export class CsiSimulator {
@@ -55,6 +56,9 @@ export class CsiSimulator {
     // /api/v1/vital-signs so the page can say *why* there are no numbers.
     this.vitalSigns = null;
     this.vitalSignsAt = null;
+    // Did the most recent governed frame carry a published value? The gate is
+    // per frame, so this is what makes a value current — not its age alone.
+    this.vitalsAuthorityOpen = false;
     this.vitalsAuthority = null;
     this.vitalsReason = null;
 
@@ -70,6 +74,7 @@ export class CsiSimulator {
    * @param {string} url - WebSocket URL (e.g. ws://localhost:3030/ws/csi)
    */
   async connectLive(url) {
+    allowReconnect(this);
     this._liveUrl = url;
     return new Promise((resolve) => {
       try {
@@ -88,6 +93,7 @@ export class CsiSimulator {
           this.serverPersons = 0;
           this.vitalSigns = null;
           this.vitalSignsAt = null;
+          this.vitalsAuthorityOpen = false;
           // Retry before giving up: a server restart must not leave this page
           // showing SYNTHETIC until someone reloads it.
           scheduleReconnect(this, () => { void this.connectLive(this._liveUrl); }, () => {
@@ -104,7 +110,11 @@ export class CsiSimulator {
   }
 
   disconnect() {
+    // A deliberate disconnect: suppress before closing, because closing fires
+    // onclose and that handler would otherwise schedule a retry (the reviewer's
+    // second changed-code defect).
     cancelReconnect(this);
+    suppressReconnect(this);
     this._liveUrl = null;
     if (this.ws) { this.ws.close(); this.ws = null; }
     this.mode = 'demo';
@@ -447,6 +457,7 @@ export class CsiSimulator {
       // (~9.5% MEASURED), so clearing on every message would hide numbers the
       // server is publishing. The age is carried alongside so the display can say
       // how old it is.
+      this.vitalsAuthorityOpen = !!msg.vital_signs;
       if (msg.vital_signs) {
         this.vitalSigns = msg.vital_signs;
         this.vitalSignsAt = Date.now();
