@@ -36,7 +36,8 @@ const C = {
 
 // ---- Main Class ----
 
-import { reconnectState, scheduleReconnect, cancelReconnect, reconnectSucceeded }
+import { reconnectState, scheduleReconnect, cancelReconnect, reconnectSucceeded,
+         suppressReconnect, allowReconnect }
   from '../../services/ws-reconnect.js';
 
 class Observatory {
@@ -486,6 +487,8 @@ class Observatory {
    * first frame — not `onopen` — is what promotes the view (ADR-295).
    */
   _tryLiveCandidate(candidates, i) {
+    // An explicit connect (auto-detect or the operator's button) re-enables retries.
+    if (i === 0) allowReconnect(this);
     if (i >= candidates.length) {
       console.log('[Observatory] No sensing server detected, using demo mode');
       return;
@@ -550,6 +553,7 @@ class Observatory {
 
   // async: `/ws/sensing` is gated (ADR-272); mint a single-use ticket first.
   async _connectWS(url) {
+    allowReconnect(this);
     this._disconnectWS();
     let wsUrl = url;
     try { wsUrl = await withWsTicket(url); } catch { /* auth off or pre-ADR-272 server */ }
@@ -567,6 +571,9 @@ class Observatory {
   }
 
   _disconnectWS() {
+    // A deliberate disconnect must not be undone by the close handler scheduling a
+    // retry (reviewer's second changed-code defect).
+    suppressReconnect(this);
     if (this._ws) { this._ws.close(); this._ws = null; }
     this._liveData = null;
   }

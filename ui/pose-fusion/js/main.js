@@ -11,6 +11,7 @@ import { FusionEngine } from './fusion-engine.js?v=13';
 import { PoseDecoder } from './pose-decoder.js?v=13';
 import { CanvasRenderer } from './canvas-renderer.js?v=13';
 import { withWsTicket } from '../../services/ws-ticket.js';
+import { vitalsView } from '../../services/vitals-view.js';
 
 // === State ===
 let mode = 'dual';  // 'dual' | 'video' | 'csi'
@@ -450,31 +451,35 @@ function mainLoop(timestamp) {
   const hrEl = document.getElementById('hr-value');
   const vitalsNoteEl = document.getElementById('vitals-note');
   if (respEl || hrEl) {
-    // The gate opens on a minority of frames, so the panel shows the most recent
-    // published value with its age rather than flickering to "abstained" between
-    // publications. Past VITALS_MAX_AGE_S the value is no longer current and says so.
-    const VITALS_MAX_AGE_S = 20;
-    const vs = csiSimulator.vitalSigns;
+    // The decision of what may be shown as *current* lives in
+    // services/vitals-view.js, where it is unit-tested: the gate opens on a
+    // minority of frames (MEASURED ~9.5%), so clearing on every frame hid values
+    // the server was publishing, while keeping one visible after authority closed
+    // presented an expired authorization as a live measurement. A value is current
+    // only while its own frame carried authority and it is young; otherwise the
+    // numeric fields are withheld and the last value is downgraded to an explicitly
+    // historical line.
     const at = csiSimulator.vitalSignsAt;
-    const ageS = at ? Math.round((Date.now() - at) / 1000) : null;
-    const fresh = vs && ageS !== null && ageS <= VITALS_MAX_AGE_S;
-    const fmt = (v, unit, digits) =>
-      (typeof v === 'number' && isFinite(v)) ? `${v.toFixed(digits)} ${unit}` : null;
-    const suffix = fresh ? ` (${ageS}s)` : '';
-    const resp = fresh ? fmt(vs.breathing_rate_bpm, 'rpm', 1) : null;
-    const hr = fresh ? fmt(vs.heart_rate_bpm, 'bpm', 0) : null;
-    if (respEl) {
-      respEl.textContent = resp ? resp + suffix : 'abstained';
-      respEl.style.color = resp ? 'var(--cyan)' : 'rgba(150,150,150,0.7)';
-    }
-    if (hrEl) {
-      hrEl.textContent = hr ? hr + suffix : 'abstained';
-      hrEl.style.color = hr ? 'var(--cyan)' : 'rgba(150,150,150,0.7)';
-    }
-    if (vitalsNoteEl) {
-      vitalsNoteEl.textContent = fresh
-        ? `published; age shown — the gate reopens when confidence clears the threshold`
-        : (csiSimulator.vitalsReason || 'needs a fresh calibration and exactly one occupant');
+    const view = vitalsView({
+      vitals: csiSimulator.vitalSigns,
+      ageSeconds: at ? (Date.now() - at) / 1000 : null,
+      authorityOpen: csiSimulator.vitalsAuthorityOpen === true,
+      reason: csiSimulator.vitalsReason,
+    });
+    const paint = (el, text) => {
+      if (!el) return;
+      el.textContent = text;
+      el.style.color = (view.state === 'current')
+        ? 'var(--cyan)'
+        : 'rgba(150,150,150,0.7)';
+    };
+    paint(respEl, view.breathing);
+    paint(hrEl, view.heart);
+    if (vitalsNoteEl) vitalsNoteEl.textContent = view.note;
+    const histEl = document.getElementById('vitals-history');
+    if (histEl) {
+      histEl.textContent = view.historical ? `last published: ${view.historical.text}` : '';
+      histEl.style.display = view.historical ? '' : 'none';
     }
   }
 
