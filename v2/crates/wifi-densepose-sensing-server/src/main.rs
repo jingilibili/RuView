@@ -365,6 +365,11 @@ impl CsiGridKey {
 struct RawGridObservation {
     grid: CsiGridKey,
     observed_at: std::time::Instant,
+    /// RSSI the node reported for this frame. Frames on one grid that all
+    /// arrive at the same strength belong to one transmitter population;
+    /// a wide spread means the grid mixes sources, and a mixture makes the
+    /// field model's residual follow traffic instead of the room.
+    rssi_dbm: Option<i8>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -374,6 +379,10 @@ struct CalibrationGridEvidence {
     rate_hz: f64,
     max_gap_s: f64,
     latest_age_s: f64,
+    /// Spread of the frames' RSSI on this grid, or `None` when the node
+    /// reported no usable RSSI. Smaller is a more homogeneous population.
+    rssi_spread_db: Option<i32>,
+    rssi_median_dbm: Option<i8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1369,7 +1378,12 @@ impl NodeState {
         }
     }
 
-    fn observe_raw_grid(&mut self, grid: CsiGridKey, now: std::time::Instant) {
+    fn observe_raw_grid(
+        &mut self,
+        grid: CsiGridKey,
+        rssi_dbm: Option<i8>,
+        now: std::time::Instant,
+    ) {
         while self
             .raw_grid_observations
             .front()
@@ -1386,6 +1400,7 @@ impl NodeState {
         self.raw_grid_observations.push_back(RawGridObservation {
             grid,
             observed_at: now,
+            rssi_dbm,
         });
     }
 
@@ -1393,7 +1408,7 @@ impl NodeState {
         &self,
         now: std::time::Instant,
     ) -> Vec<(CsiGridKey, CalibrationGridEvidence)> {
-        let mut grouped: Vec<(CsiGridKey, Vec<std::time::Instant>)> = Vec::new();
+        let mut grouped: Vec<(CsiGridKey, Vec<(std::time::Instant, Option<i8>)>)> = Vec::new();
         for sample in self.raw_grid_observations.iter().filter(|sample| {
             now.saturating_duration_since(sample.observed_at)
                 <= CALIBRATION_GRID_EVIDENCE_WINDOW
@@ -1402,23 +1417,24 @@ impl NodeState {
                 .iter_mut()
                 .find(|(candidate, _)| *candidate == sample.grid)
             {
-                arrivals.push(sample.observed_at);
+                arrivals.push((sample.observed_at, sample.rssi_dbm));
             } else {
-                grouped.push((sample.grid, vec![sample.observed_at]));
+                grouped.push((sample.grid, vec![(sample.observed_at, sample.rssi_dbm)]));
             }
         }
         grouped
             .into_iter()
             .filter_map(|(grid, arrivals)| {
-                let first = *arrivals.first()?;
-                let last = *arrivals.last()?;
+                let first = arrivals.first()?.0;
+                let last = arrivals.last()?.0;
                 let span_s = last.saturating_duration_since(first).as_secs_f64();
                 let latest_age_s = now.saturating_duration_since(last).as_secs_f64();
                 let mut max_gap_s = latest_age_s;
                 for pair in arrivals.windows(2) {
                     max_gap_s = max_gap_s.max(
                         pair[1]
-                            .saturating_duration_since(pair[0])
+                            .0
+                            .saturating_duration_since(pair[0].0)
                             .as_secs_f64(),
                     );
                 }
@@ -1426,6 +1442,18 @@ impl NodeState {
                     arrivals.len().saturating_sub(1) as f64 / span_s
                 } else {
                     0.0
+                };
+                let mut strengths: Vec<i8> = arrivals.iter().filter_map(|pair| pair.1).collect();
+                strengths.sort_unstable();
+                let (rssi_spread_db, rssi_median_dbm) = match strengths.len() {
+                    0 => (None, None),
+                    _ => (
+                        Some(
+                            i32::from(*strengths.last().unwrap())
+                                - i32::from(*strengths.first().unwrap()),
+                        ),
+                        Some(strengths[strengths.len() / 2]),
+                    ),
                 };
                 Some((
                     grid,
@@ -1435,6 +1463,8 @@ impl NodeState {
                         rate_hz,
                         max_gap_s,
                         latest_age_s,
+                        rssi_spread_db,
+                        rssi_median_dbm,
                     },
                 ))
             })
@@ -1455,8 +1485,17 @@ impl NodeState {
                     && evidence.latest_age_s < CALIBRATION_GRID_MAX_GAP_S
             })
             .min_by(|(left_grid, left), (right_grid, right)| {
-                left.max_gap_s
-                    .total_cmp(&right.max_gap_s)
+                // Homogeneity first: the residual comparison is only
+                // meaningful when the calibration and the runtime windows
+                // come from the same transmitter population, and the RSSI
+                // spread of a grid measures exactly that. Rate and gap stay
+                // as gatekeepers (eligibility) and tie breakers.
+                let homogeneity = match (left.rssi_spread_db, right.rssi_spread_db) {
+                    (Some(left_spread), Some(right_spread)) => left_spread.cmp(&right_spread),
+                    _ => std::cmp::Ordering::Equal,
+                };
+                homogeneity
+                    .then_with(|| left.max_gap_s.total_cmp(&right.max_gap_s))
                     .then_with(|| right.rate_hz.total_cmp(&left.rate_hz))
                     .then_with(|| right_grid.n_subcarriers.cmp(&left_grid.n_subcarriers))
                     .then_with(|| left_grid.ppdu_type.cmp(&right_grid.ppdu_type))
@@ -2370,6 +2409,8 @@ impl AppStateInner {
     /// build the training router without the full server boot.
     pub(crate) fn minimal() -> Self {
         AppStateInner {
+            vitals_null: VitalsNullCollector::default(),
+            vitals_null_floors: HashMap::new(),
             latest_update: None,
             rssi_history: VecDeque::new(),
             frame_history: VecDeque::new(),
@@ -6895,12 +6936,14 @@ mod bootstrap_vital_publication_tests {
         for index in 0..=48 {
             node.observe_raw_grid(
                 stable,
+                Some(-40),
                 start + std::time::Duration::from_millis(index * 250),
             );
         }
         for index in 0..=6 {
             node.observe_raw_grid(
                 sparse,
+                Some(-40),
                 start + std::time::Duration::from_secs(index * 2),
             );
         }
@@ -6910,6 +6953,47 @@ mod bootstrap_vital_publication_tests {
         assert_eq!(selected, stable);
         assert!(evidence.rate_hz >= 3.9);
         assert!(evidence.max_gap_s < 5.0);
+    }
+
+    /// MEASURED on the room B rig: the 306-bin grid carried the node's own ping
+    /// replies with a 1-3 dB RSSI spread while the 192-bin grid mixed sources
+    /// with a 15-43 dB spread. Binding the mixed grid made the field model's
+    /// residual follow injected traffic (median 9.4 to 17.4 at 2000 pps) while
+    /// the operator sat motionless, which is larger than the occupant's own
+    /// effect. The faster grid must therefore not win on rate alone.
+    #[test]
+    fn calibration_grid_selection_prefers_a_homogeneous_population() {
+        let start = std::time::Instant::now();
+        let mut node = NodeState::new();
+        let steady = CsiGridKey {
+            n_subcarriers: 306,
+            ppdu_type: 0,
+        };
+        let mixed = CsiGridKey {
+            n_subcarriers: 192,
+            ppdu_type: 0,
+        };
+        for index in 0..=200 {
+            node.observe_raw_grid(
+                steady,
+                Some(-27),
+                start + std::time::Duration::from_millis(index * 66),
+            );
+        }
+        for index in 0..=300 {
+            let rssi = if index % 2 == 0 { -25 } else { -65 };
+            node.observe_raw_grid(
+                mixed,
+                Some(rssi),
+                start + std::time::Duration::from_millis(index * 50),
+            );
+        }
+        let (selected, evidence) = node
+            .select_calibration_grid(start + std::time::Duration::from_secs(16))
+            .expect("a grid is eligible");
+        assert_eq!(selected, steady);
+        assert_eq!(evidence.rssi_spread_db, Some(0));
+        assert_eq!(evidence.rssi_median_dbm, Some(-27));
     }
 
     #[tokio::test]
@@ -6943,6 +7027,7 @@ mod bootstrap_vital_publication_tests {
             for index in 0..=40 {
                 node.observe_raw_grid(
                     test_grid(),
+                    Some(-45),
                     start + std::time::Duration::from_millis(index * 250),
                 );
             }
@@ -9324,7 +9409,7 @@ async fn udp_receiver_task(
                     s.node_states
                         .entry(frame.node_id)
                         .or_insert_with(NodeState::new)
-                        .observe_raw_grid(grid_key, observed_at);
+                        .observe_raw_grid(grid_key, Some(frame.rssi), observed_at);
 
                     // The field model owns a separate, frozen grid path. Feed
                     // it before the global inference grid gate so a stable
