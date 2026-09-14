@@ -859,25 +859,33 @@ impl FieldModel {
             robust_scale,
             stored_threshold,
             robust_threshold,
-            effective_threshold: robust_threshold.min(stored_threshold),
+            // MEASURED: the stored p95 x margin boundary is the right rule
+            // once the frames come from one population. On the room B rig
+            // with the homogeneous 306-bin grid it sits between the empty
+            // room (p50 5.00, p90 10.67, max 18.03) and a seated occupant
+            // (p10 25.67, p50 30.72) with 0-2 percent false positives and
+            // about 97 percent detection, while the quiet-floor tightening
+            // (p25 x 1.5 = 3.12) called 68 percent of a verified empty room
+            // occupied. `robust_threshold` stays in the report as advice.
+            effective_threshold: stored_threshold,
             contamination_ratio,
             contaminated: contamination_ratio > EMPTY_ROOM_CONTAMINATION_RATIO,
         })
     }
 
-    /// Boundary the runtime empty-room comparison applies. It is the tighter
-    /// of the learned boundary and the robust median-derived one, so a noisy
-    /// calibration cannot keep a still occupant invisible and the robust
-    /// statistic can never widen the learned suppression range.
+    /// Boundary the runtime empty-room comparison applies: the boundary stored
+    /// at finalization, `p95 x EMPTY_ROOM_RESIDUAL_MARGIN`.
+    ///
+    /// It is deliberately not tightened to the quiet floor. That was tried
+    /// after a hold that had the operator inside it, and on a homogeneous
+    /// frame population the tightening is what breaks the detector: MEASURED
+    /// empty-room p50 5.00 / p90 10.67 / max 18.03 against a seated occupant
+    /// at p10 25.67 / p50 30.72, where the stored 16.01 gives 0-2 percent
+    /// false positives and about 97 percent detection, while `p25 x 1.5`
+    /// called 68 percent of the verified empty room occupied.
     pub fn effective_empty_room_threshold(&self) -> Option<f64> {
-        let stored = self
-            .empty_room_residual_energy_threshold()?
-            .max(EMPTY_ROOM_RESIDUAL_ENERGY_MAX);
-        Some(
-            self.empty_room_reference_stats()
-                .map(|stats| stats.effective_threshold.min(stored))
-                .unwrap_or(stored),
-        )
+        self.empty_room_residual_energy_threshold()
+            .map(|threshold| threshold.max(EMPTY_ROOM_RESIDUAL_ENERGY_MAX))
     }
 
     /// Refine a completed single-link empty-room boundary with scalar residuals
@@ -2388,17 +2396,20 @@ mod tests {
             .is_err());
     }
 
-    /// A ten minute empty-room calibration is not always quiet: motion in an
-    /// adjacent room, a door, an appliance, or an animal lands in the upper tail
-    /// of the window residuals. The stored boundary is that 95th percentile
-    /// times the empty-room margin, so a still occupant whose residual sits
-    /// between the quiet median and that inflated tail used to be reported as an
-    /// empty room. Measured in room B: stored boundary 23.79 against a settled
-    /// empty level of 3.7-5.5 and a person sitting still on the floor at 6-29
-    /// (median 14), so `person_count` stayed zero and the ADR-021 publication
-    /// gate could never open.
+    /// A calibration hold is not always quiet: motion in an adjacent room, a
+    /// door, an appliance, or an animal lands in the upper tail of the window
+    /// residuals. The disturbance has to be *reported* - the reference carries a
+    /// contamination flag and the quiet-floor advice - while the decision stays
+    /// on the boundary stored at finalization.
+    ///
+    /// MEASURED on the room B rig with the homogeneous 306-bin population: empty
+    /// room p50 5.00, p90 10.67, max 18.03 against a seated occupant at p10
+    /// 25.67 and p50 30.72. The stored boundary sat between them with 0-2 percent
+    /// false positives and about 97 percent detection, while applying the
+    /// quiet-floor tightening (p25 x 1.5) called 68 percent of the same verified
+    /// empty room occupied.
     #[test]
-    fn disturbed_calibration_reference_tightens_the_effective_boundary() {
+    fn disturbed_calibration_is_reported_but_keeps_the_stored_boundary() {
         let config = FieldModelConfig {
             n_links: 1,
             n_subcarriers: 8,
@@ -2446,34 +2457,28 @@ mod tests {
             stats.contaminated,
             "a disturbed calibration must be reported: {stats:?}"
         );
-        assert!(stats.stored_threshold > stats.robust_threshold);
-        let effective = model.effective_empty_room_threshold().unwrap();
-        assert_eq!(effective, stats.effective_threshold);
-        assert!(effective < stats.stored_threshold);
+        assert!(stats.robust_threshold < stats.stored_threshold);
+        assert_eq!(
+            model.effective_empty_room_threshold().unwrap(),
+            stats.stored_threshold,
+            "the decision keeps the stored boundary; the quiet floor is advice"
+        );
 
-        // A quiet window still reads as an empty room.
+        // A quiet window reads as an empty room, and the disturbance that lifted
+        // the reference tail still fits inside the stored boundary - which is the
+        // measured trade-off of keeping it.
         let quiet_window: Vec<Vec<f64>> = (1_200..1_250).map(quiet).collect();
         let quiet_match = model.empty_room_match(&quiet_window).expect("quiet match");
         assert!(quiet_match.matches_empty);
         assert!(quiet_match.reference_contaminated);
-        assert_eq!(
-            quiet_match.stored_residual_energy_threshold,
-            stats.stored_threshold
-        );
-        assert!(quiet_match.residual_energy <= effective);
+        assert!(quiet_match.residual_energy <= stats.stored_threshold);
 
-        // The disturbance that inflated the learned boundary no longer hides
-        // behind it: the same signature is what a still occupant looks like
-        // against the quiet reference.
         let disturbed_window: Vec<Vec<f64>> = (700..750).map(disturbed).collect();
         let disturbed_match = model
             .empty_room_match(&disturbed_window)
             .expect("disturbed match");
-        assert!(
-            !disturbed_match.matches_empty,
-            "residual {} must exceed the effective boundary {effective}",
-            disturbed_match.residual_energy
-        );
+        assert!(disturbed_match.residual_energy <= stats.stored_threshold);
+        assert!(disturbed_match.matches_empty);
     }
 
     /// A quiet calibration keeps the boundary the operator-visible model
