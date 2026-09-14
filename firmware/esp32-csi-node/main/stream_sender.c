@@ -51,6 +51,19 @@ static int sender_init_internal(const char *ip, uint16_t port)
         return -1;
     }
 
+    /* A broadcast target (255.255.255.255 or the subnet broadcast) lets
+     * every host on the LAN receive the stream, so a DHCP lease change on
+     * the aggregator cannot silently stop the data. MEASURED on the room B
+     * rig: the aggregator moved from 192.168.1.5 to 192.168.1.6 while a
+     * fourth node took .5, every node kept sending to the old address, and
+     * the pipeline looked dead for the whole session even though all nodes
+     * were powered and streaming. Broadcast needs SO_BROADCAST. */
+    int broadcast_enable = 1;
+    if (setsockopt(s_sock, SOL_SOCKET, SO_BROADCAST,
+                   &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+        ESP_LOGW(TAG, "SO_BROADCAST unavailable: errno %d", errno);
+    }
+
     memset(&s_dest_addr, 0, sizeof(s_dest_addr));
     s_dest_addr.sin_family = AF_INET;
     s_dest_addr.sin_port = htons(port);

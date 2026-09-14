@@ -33,7 +33,14 @@ menu "CSI Node Configuration"
         string "Aggregator IP address"
         default "192.168.1.100"
         help
-            IP address of the UDP aggregator host.
+            IP address of the UDP aggregator host. A broadcast address
+            (255.255.255.255, or the subnet broadcast such as 192.168.1.255)
+            is also accepted: the sender enables SO_BROADCAST for it, so every
+            host on the LAN receives the stream and the pipeline no longer
+            depends on one DHCP lease. MEASURED failure this avoids: the
+            aggregator held 192.168.1.5, a newly powered node took .5 from
+            DHCP, and every node kept sending to the old address while the
+            system looked dead.
 
     config CSI_TARGET_PORT
         int "Aggregator UDP port"
