@@ -149,10 +149,32 @@ pub struct CalibratedOccupancy {
 /// Create a FieldModelConfig for single-link mode (one ESP32 node = one link).
 /// This avoids the DimensionMismatch error when feeding single-frame observations.
 pub fn single_link_config() -> FieldModelConfig {
-    FieldModelConfig {
+    // The shipped defaults are a thousand frames over six hundred seconds
+    // (#1756: slow environmental variation needs a long window). A room that
+    // cannot be guaranteed empty for ten minutes - one shared with animals, or
+    // one being commissioned repeatedly - needs a shorter hold, and that must be
+    // an explicit operator choice rather than a silent one:
+    //   WDP_CAL_MIN_DURATION_S  minimum wall-clock window, seconds
+    //   WDP_CAL_MIN_FRAMES      minimum accepted frames
+    let mut config = FieldModelConfig {
         n_links: 1,
         ..FieldModelConfig::default()
+    };
+    if let Ok(value) = std::env::var("WDP_CAL_MIN_DURATION_S") {
+        if let Ok(seconds) = value.trim().parse::<f64>() {
+            if seconds.is_finite() && seconds >= 0.0 {
+                config.min_calibration_duration_s = seconds;
+            }
+        }
     }
+    if let Ok(value) = std::env::var("WDP_CAL_MIN_FRAMES") {
+        if let Ok(frames) = value.trim().parse::<usize>() {
+            if frames > 0 {
+                config.min_calibration_frames = frames;
+            }
+        }
+    }
+    config
 }
 
 /// Resolve the model status at the observation wall clock. `FieldModel::status`
