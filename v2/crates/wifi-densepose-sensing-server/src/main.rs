@@ -2009,6 +2009,12 @@ struct AppStateInner {
     engine_bridge: engine_bridge::EngineBridge,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
     field_model: Option<FieldModel>,
+    /// Leaky duty-cycle accumulator for occupancy, in seconds of evidence:
+    /// positive while a window reads occupied, negative while it reads
+    /// empty. See `observe_occupancy`.
+    occupancy_score: f64,
+    /// When `occupancy_score` was last advanced.
+    occupancy_score_updated: Option<std::time::Instant>,
     /// Spectral evidence gathered during the current empty-room collection.
     vitals_null: VitalsNullCollector,
     /// Per-node evidence summary from the last completed calibration.
@@ -2394,33 +2400,40 @@ impl AppStateInner {
     /// flicker MEASURED in a still room while still registering a person who walks
     /// in within a couple of seconds.
     fn observe_occupancy(&mut self, raw: usize, now: std::time::Instant) -> usize {
-        if raw == self.stable_occupancy {
-            self.occupancy_candidate = raw;
-            self.occupancy_candidate_since = None;
-            return self.stable_occupancy;
-        }
-        // Lowering the reported count is a release: it needs the longer
-        // hold so a still occupant is not dropped between boundary
-        // crossings. Raising it stays responsive.
-        let hold_ms = if raw < self.stable_occupancy {
-            OCCUPANCY_RELEASE_MS
-        } else {
-            OCCUPANCY_DWELL_MS
-        };
-        match self.occupancy_candidate_since {
-            Some(since)
-                if self.occupancy_candidate == raw
-                    && now.saturating_duration_since(since)
-                        >= Duration::from_millis(hold_ms) =>
-            {
-                self.stable_occupancy = raw;
-                self.occupancy_candidate_since = None;
-            }
-            Some(_) if self.occupancy_candidate == raw => {}
-            _ => {
-                self.occupancy_candidate = raw;
-                self.occupancy_candidate_since = Some(now);
-            }
+        // Duty cycle, not peak. A person and an animal produce different sized
+        // peaks on this rig, but the peaks overlap: the longest burst measured
+        // in an empty room with three cats was 18 s, while a seated operator
+        // held the boundary 87.8 percent of the time with runs up to 36 s. A
+        // leaky accumulator over a fixed window separates the two by how much
+        // of the window reads occupied, which differs by an order of magnitude
+        // (87.8 percent against 9.2 percent).
+        let window = occupancy_ms_from_env(
+            "WDP_OCCUPANCY_DUTY_WINDOW_MS",
+            OCCUPANCY_DUTY_WINDOW_MS,
+        ) as f64
+            / 1000.0;
+        let acquire = occupancy_ms_from_env(
+            "WDP_OCCUPANCY_DUTY_ACQUIRE_MS",
+            OCCUPANCY_DUTY_ACQUIRE_MS,
+        ) as f64
+            / 1000.0;
+        let release = occupancy_ms_from_env(
+            "WDP_OCCUPANCY_DUTY_RELEASE_MS",
+            OCCUPANCY_DUTY_RELEASE_MS,
+        ) as f64
+            / 1000.0;
+        // Capped so a pause in the feed cannot jump the score.
+        let dt = self
+            .occupancy_score_updated
+            .map(|last| now.saturating_duration_since(last).as_secs_f64().min(1.0))
+            .unwrap_or(0.0);
+        self.occupancy_score_updated = Some(now);
+        let step = if raw >= 1 { dt } else { -dt };
+        self.occupancy_score = (self.occupancy_score + step).clamp(-window, window);
+        if self.occupancy_score >= acquire {
+            self.stable_occupancy = raw.max(1);
+        } else if self.occupancy_score <= -release {
+            self.stable_occupancy = 0;
         }
         self.stable_occupancy
     }
@@ -2590,6 +2603,8 @@ impl AppStateInner {
     /// build the training router without the full server boot.
     pub(crate) fn minimal() -> Self {
         AppStateInner {
+            occupancy_score: 0.0,
+            occupancy_score_updated: None,
             vitals_null: VitalsNullCollector::default(),
             vitals_null_floors: HashMap::new(),
             latest_update: None,
@@ -3815,18 +3830,28 @@ const MOTION_NOISE_FLOOR_PRIOR: f64 = 0.03;
 /// a person sitting still: the eigenvalue estimate flipped between 0 and 1 every
 /// few seconds, which made vitals publication intermittent and the presence
 /// display flicker. Two seconds still registers a person walking in promptly.
-const OCCUPANCY_DWELL_MS: u64 = 2_000;
-/// Releasing a reported occupant is deliberately slower than acquiring
-/// one. A person sitting still does not hold a steady above-boundary
-/// residual: MEASURED on the room B rig, a motionless occupant on the
-/// floor dropped back below the empty-room boundary in bursts of about
-/// six seconds, because the residual is driven by small posture and
-/// ambient traffic changes rather than by a constant shadow. With the
-/// symmetric dwell those bursts released the occupant for a few seconds
-/// and the ADR-021 gate, which requires exactly one occupant, closed
-/// again mid-session. Entry keeps the fast path so someone walking in is
-/// still registered within a couple of seconds.
-const OCCUPANCY_RELEASE_MS: u64 = 12_000;
+/// The leaky accumulator window used to measure duty cycle. MEASURED: a
+/// seated operator held the boundary 87.8 percent of the time over 41
+/// samples (longest run 36 s) while an empty room with three cats held it
+/// 9.2 percent over 437 samples (longest burst 18 s), so a plain dwell
+/// either admits a cat burst or delays a person. Override with
+/// WDP_OCCUPANCY_DUTY_WINDOW_MS.
+const OCCUPANCY_DUTY_WINDOW_MS: u64 = 30_000;
+/// Accumulated above-boundary time that reports an occupant (70 percent
+/// of the window). Override with WDP_OCCUPANCY_DUTY_ACQUIRE_MS.
+const OCCUPANCY_DUTY_ACQUIRE_MS: u64 = 21_000;
+/// Accumulated below-boundary time that releases the occupant (50 percent
+/// of the window). Override with WDP_OCCUPANCY_DUTY_RELEASE_MS.
+const OCCUPANCY_DUTY_RELEASE_MS: u64 = 15_000;
+
+/// Environment override for a positive millisecond setting.
+fn occupancy_ms_from_env(name: &str, fallback: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
 
 /// How far apart two nodes' heart-rate estimates may be and still count as
 /// corroborating each other. MEASURED spread on this array when the estimates
@@ -6309,6 +6334,10 @@ struct VitalsNullFloor {
     samples: usize,
     breathing_p50: f64,
     breathing_p95: f64,
+    /// Same summary for the phase-difference breathing feature, so the two
+    /// can be compared against their own noise on one session.
+    breathing_phase_p50: f64,
+    breathing_phase_p95: f64,
     heartbeat_p50: f64,
     heartbeat_p95: f64,
 }
@@ -6367,7 +6396,12 @@ impl VitalsNullCollector {
                 .iter()
                 .map(|evidence| evidence.heartbeat_peak_ratio)
                 .collect();
+            let mut breathing_phase: Vec<f64> = samples
+                .iter()
+                .map(|evidence| evidence.breathing_phase_peak_ratio)
+                .collect();
             let breathing_p50 = percentile_of(&mut breathing, 50).unwrap_or(0.0);
+            let breathing_phase_p50 = percentile_of(&mut breathing_phase, 50).unwrap_or(0.0);
             let heartbeat_p50 = percentile_of(&mut heartbeat, 50).unwrap_or(0.0);
             out.insert(
                 *node_id,
@@ -6376,6 +6410,12 @@ impl VitalsNullCollector {
                     breathing_p50,
                     breathing_p95: percentile_of(&mut breathing, VITALS_NULL_PERCENTILE)
                         .unwrap_or(0.0),
+                    breathing_phase_p50,
+                    breathing_phase_p95: percentile_of(
+                        &mut breathing_phase,
+                        VITALS_NULL_PERCENTILE,
+                    )
+                    .unwrap_or(0.0),
                     heartbeat_p50,
                     heartbeat_p95: percentile_of(&mut heartbeat, VITALS_NULL_PERCENTILE)
                         .unwrap_or(0.0),
@@ -7677,6 +7717,42 @@ mod bootstrap_vital_publication_tests {
         assert_eq!(evidence.rssi_median_dbm, Some(-27));
     }
 
+    /// MEASURED discriminator: an 18 s burst (the longest seen in an empty room
+    /// with three cats) and a cat-like duty cycle must not acquire an occupant,
+    /// while a person-like duty cycle must.
+    #[test]
+    fn occupancy_follows_duty_cycle_not_peaks() {
+        let mut state = AppStateInner::minimal();
+        let tick = std::time::Duration::from_millis(500);
+        let mut now = std::time::Instant::now();
+
+        for _ in 0..36 {
+            state.observe_occupancy(1, now);
+            now += tick;
+        }
+        assert_eq!(
+            state.stable_occupancy, 0,
+            "an 18 second burst must not be reported as an occupant"
+        );
+
+        // A cat-like 9 percent duty cycle over 200 s must not acquire either.
+        for index in 0..400 {
+            state.observe_occupancy(if index % 11 == 0 { 1 } else { 0 }, now);
+            now += tick;
+        }
+        assert_eq!(state.stable_occupancy, 0, "a cat-like duty cycle is not a person");
+
+        // A person-like 88 percent duty cycle must acquire.
+        for index in 0..200 {
+            state.observe_occupancy(if index % 8 == 0 { 0 } else { 1 }, now);
+            now += tick;
+        }
+        assert_eq!(
+            state.stable_occupancy, 1,
+            "a person-like duty cycle must be reported as an occupant"
+        );
+    }
+
     #[tokio::test]
     async fn calibration_start_requires_evidence_then_binds_the_qualified_grid() {
         let mut inner = AppStateInner::minimal();
@@ -8421,6 +8497,8 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
                 "samples": floor.samples,
                 "breathing_p50_ratio": floor.breathing_p50,
                 "breathing_p95_ratio": floor.breathing_p95,
+                "breathing_phase_p50_ratio": floor.breathing_phase_p50,
+                "breathing_phase_p95_ratio": floor.breathing_phase_p95,
                 "heartbeat_p50_ratio": floor.heartbeat_p50,
                 "heartbeat_p95_ratio": floor.heartbeat_p95,
             })
@@ -9303,6 +9381,14 @@ async fn vital_signs_diagnostics_endpoint(
             "breathing_peak_ratio": node.vital_detector.last_evidence().breathing_peak_ratio,
             "heartbeat_peak_ratio": node.vital_detector.last_evidence().heartbeat_peak_ratio,
             "null_breathing_p95_ratio": s.vitals_null_floors.get(&node_id).map(|floor| floor.breathing_p95),
+            "breathing_phase_ratio": node.vital_detector.last_evidence().breathing_phase_peak_ratio,
+            "null_breathing_phase_p95_ratio": s.vitals_null_floors.get(&node_id).map(|floor| floor.breathing_phase_p95),
+            "breathing_phase_over_null": s.vitals_null_floors.get(&node_id).and_then(|floor| {
+                (floor.breathing_phase_p95 > f64::EPSILON).then_some(
+                    node.vital_detector.last_evidence().breathing_phase_peak_ratio
+                        / floor.breathing_phase_p95,
+                )
+            }),
             "null_heartbeat_p95_ratio": s.vitals_null_floors.get(&node_id).map(|floor| floor.heartbeat_p95),
             "breathing_ratio_over_null": s.vitals_null_floors.get(&node_id).and_then(|floor| {
                 (floor.breathing_p95 > f64::EPSILON).then_some(
@@ -12398,6 +12484,8 @@ async fn main() {
         // Empty-room vitals noise: gathered while a calibration holds the
         // room empty, summarized when that collection finalizes
         // (see VitalsNullCollector).
+        occupancy_score: 0.0,
+        occupancy_score_updated: None,
         vitals_null: VitalsNullCollector::default(),
         vitals_null_floors: HashMap::new(),
         latest_update: None,
