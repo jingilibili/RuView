@@ -610,8 +610,16 @@ fn debounce_room_classification(state: &mut AppStateInner, raw: &RoomInference) 
     }
 
     ClassificationInfo {
+        // Motion is not the source of truth for presence. MEASURED: a seated
+        // occupant held the field-model boundary for 67 consecutive samples
+        // (residual 55-88 against an empty level of 8) while every node reported
+        // `motion_level: "absent"`, so a motion-derived verdict sent 32 266
+        // consecutive frames to the browser with no presence while a person was
+        // in the room. Presence is the union of motion evidence and the
+        // calibrated occupancy, which is duty-cycle filtered, so a still
+        // occupant reads as present with absent motion.
         motion_level: state.room_debounced_level.clone(),
-        presence: state.room_debounced_level != "absent",
+        presence: state.room_debounced_level != "absent" || state.stable_occupancy > 0,
         confidence: raw.confidence,
     }
 }
@@ -10334,8 +10342,15 @@ async fn udp_receiver_task(
                         pose_keypoints: None,
                         model_status: None,
                         persons: None,
-                        estimated_persons: if total_persons > 0 {
-                            Some(total_persons)
+                        // The count must agree with the presence verdict beside
+                        // it. MEASURED: in a verified empty room the frame carried
+                        // `estimated_persons: 1` next to `presence: false`, because
+                        // the raw estimator count bypassed the duty-cycle filter
+                        // that the verdict uses, so a consumer trusting the count
+                        // (the shipped UI prefers it) showed an occupant in an
+                        // empty room. `stable_occupancy` is the filtered value.
+                        estimated_persons: if s.stable_occupancy > 0 {
+                            Some(s.stable_occupancy)
                         } else {
                             None
                         },
@@ -10916,8 +10931,15 @@ async fn udp_receiver_task(
                         pose_keypoints: None,
                         model_status: None,
                         persons: None,
-                        estimated_persons: if total_persons > 0 {
-                            Some(total_persons)
+                        // The count must agree with the presence verdict beside
+                        // it. MEASURED: in a verified empty room the frame carried
+                        // `estimated_persons: 1` next to `presence: false`, because
+                        // the raw estimator count bypassed the duty-cycle filter
+                        // that the verdict uses, so a consumer trusting the count
+                        // (the shipped UI prefers it) showed an occupant in an
+                        // empty room. `stable_occupancy` is the filtered value.
+                        estimated_persons: if s.stable_occupancy > 0 {
+                            Some(s.stable_occupancy)
                         } else {
                             None
                         },
