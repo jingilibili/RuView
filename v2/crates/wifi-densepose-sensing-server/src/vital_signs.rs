@@ -51,6 +51,11 @@ pub struct SpectralEvidence {
     pub breathing_peak_ratio: f64,
     /// Peak power over band mean power in the heartbeat band.
     pub heartbeat_peak_ratio: f64,
+    /// Peak power over band mean power for the mean adjacent-subcarrier
+    /// phase difference, band-limited to the breathing band. Comparable
+    /// with `breathing_peak_ratio` and recorded the same way, so a session
+    /// can show which of the two actually follows a chest.
+    pub breathing_phase_peak_ratio: f64,
 }
 
 /// Vital sign readings produced each frame.
@@ -98,6 +103,12 @@ pub struct VitalSignDetector {
     /// See `RATE_CHANGE_CONFIRMATIONS`.
     pending_rate: Option<(f64, u32)>,
     breathing_buffer: VecDeque<f64>,
+    /// Rolling buffer of mean adjacent-subcarrier phase differences. The
+    /// difference between neighbouring subcarriers cancels the per-packet
+    /// sampling-time and carrier-frequency offsets that corrupt raw phase,
+    /// so this keeps the physical path change where the amplitude mean
+    /// averages it away.
+    breathing_phase_buffer: VecDeque<f64>,
     /// Rolling buffer of phase-variance samples for heartbeat detection.
     heartbeat_buffer: VecDeque<f64>,
     /// CSI frame arrival rate in Hz.
@@ -145,6 +156,7 @@ impl VitalSignDetector {
         Self {
             pending_rate: None,
             breathing_buffer: VecDeque::with_capacity(breathing_capacity.max(1)),
+            breathing_phase_buffer: VecDeque::with_capacity(breathing_capacity.max(1)),
             heartbeat_buffer: VecDeque::with_capacity(heartbeat_capacity.max(1)),
             sample_rate,
             breathing_window_secs,
@@ -211,6 +223,30 @@ impl VitalSignDetector {
             }
         };
 
+        // -- Feature 3: mean adjacent-subcarrier phase difference --
+        // A linear phase ramp across subcarriers comes from the sampling
+        // time and carrier frequency offsets, not from the room. Taking the
+        // difference between neighbours removes the ramp and leaves the
+        // frequency-selective physical term, which a chest displacement
+        // modulates. The circular mean keeps the result stable across the
+        // +/-pi wrap.
+        let phase_slope = if phase.len() > 1 {
+            let mut sum_sin = 0.0_f64;
+            let mut sum_cos = 0.0_f64;
+            for pair in phase.windows(2) {
+                let delta = pair[1] - pair[0];
+                sum_sin += delta.sin();
+                sum_cos += delta.cos();
+            }
+            sum_sin.atan2(sum_cos)
+        } else {
+            0.0
+        };
+        self.breathing_phase_buffer.push_back(phase_slope);
+        while self.breathing_phase_buffer.len() > self.breathing_capacity {
+            self.breathing_phase_buffer.pop_front();
+        }
+
         self.heartbeat_buffer.push_back(phase_var);
         while self.heartbeat_buffer.len() > self.heartbeat_capacity {
             self.heartbeat_buffer.pop_front();
@@ -221,9 +257,11 @@ impl VitalSignDetector {
             self.extract_breathing_with_ratio();
         let (heart_rate, heartbeat_confidence, heartbeat_ratio) =
             self.extract_heartbeat_with_ratio();
+        let (_, _, breathing_phase_ratio) = self.extract_breathing_phase_with_ratio();
         self.last_evidence = SpectralEvidence {
             breathing_peak_ratio: breathing_ratio,
             heartbeat_peak_ratio: heartbeat_ratio,
+            breathing_phase_peak_ratio: breathing_phase_ratio,
         };
 
         // -- Signal quality --
@@ -261,6 +299,19 @@ impl VitalSignDetector {
     pub fn extract_heartbeat(&self) -> (Option<f64>, f64) {
         let (rate, confidence, _) = self.extract_heartbeat_with_ratio();
         (rate, confidence)
+    }
+
+    /// Breathing estimate from the mean adjacent-subcarrier phase difference,
+    /// together with its raw peak-to-band-mean ratio.
+    pub fn extract_breathing_phase_with_ratio(&self) -> (Option<f64>, f64, f64) {
+        if self.breathing_phase_buffer.len() < MIN_BREATHING_SAMPLES {
+            return (None, 0.0, 0.0);
+        }
+
+        let data: Vec<f64> = self.breathing_phase_buffer.iter().copied().collect();
+        let filtered =
+            bandpass_filter(&data, BREATHING_MIN_HZ, BREATHING_MAX_HZ, self.sample_rate);
+        self.compute_fft_peak_with_ratio(&filtered, BREATHING_MIN_HZ, BREATHING_MAX_HZ)
     }
 
     /// Heartbeat estimate together with the raw peak-to-band-mean ratio.
@@ -762,6 +813,30 @@ mod tests {
     /// The empty-room calibration records this ratio, so it has to be exposed
     /// and it has to be above the fixed confidence threshold for a tone that is
     /// unambiguously inside the breathing band.
+    /// The phase-difference feature has to see a breathing-band tone, since a
+    /// linear per-subcarrier ramp (the sampling-time and carrier-frequency
+    /// offsets) must not hide it.
+    #[test]
+    fn phase_difference_feature_follows_a_breathing_tone() {
+        let mut detector = VitalSignDetector::new(10.0);
+        for index in 0..900 {
+            let t = index as f64 / 10.0;
+            let amplitude = vec![10.0; 8];
+            let phase: Vec<f64> = (0..8)
+                .map(|subcarrier| {
+                    let index = subcarrier as f64;
+                    0.4 * index + 0.05 * (2.0 * PI * 0.25 * t).sin() * index
+                })
+                .collect();
+            detector.process_frame(&amplitude, &phase);
+        }
+        let evidence = detector.last_evidence();
+        assert!(
+            evidence.breathing_phase_peak_ratio > CONFIDENCE_THRESHOLD,
+            "a 0.25 Hz phase tone must clear the threshold: {evidence:?}"
+        );
+    }
+
     #[test]
     fn spectral_evidence_exposes_the_raw_peak_ratio() {
         let mut detector = VitalSignDetector::new(10.0);
