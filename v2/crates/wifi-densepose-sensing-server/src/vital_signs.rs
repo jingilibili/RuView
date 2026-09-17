@@ -56,6 +56,11 @@ pub struct SpectralEvidence {
     /// with `breathing_peak_ratio` and recorded the same way, so a session
     /// can show which of the two actually follows a chest.
     pub breathing_phase_peak_ratio: f64,
+    /// Peak power over band mean power for the calibrated per-frame residual.
+    /// This is the carrier that responds to a body: MEASURED, the residual
+    /// rises 7x with an occupant while the amplitude and phase-slope features
+    /// stay at their own noise floor.
+    pub residual_breathing_peak_ratio: f64,
 }
 
 /// Vital sign readings produced each frame.
@@ -109,6 +114,9 @@ pub struct VitalSignDetector {
     /// so this keeps the physical path change where the amplitude mean
     /// averages it away.
     breathing_phase_buffer: VecDeque<f64>,
+    /// Rolling buffer of calibrated per-frame residual energies, the carrier
+    /// the breathing estimate is taken from once a field model exists.
+    residual_buffer: VecDeque<f64>,
     /// Rolling buffer of phase-variance samples for heartbeat detection.
     heartbeat_buffer: VecDeque<f64>,
     /// CSI frame arrival rate in Hz.
@@ -157,6 +165,7 @@ impl VitalSignDetector {
             pending_rate: None,
             breathing_buffer: VecDeque::with_capacity(breathing_capacity.max(1)),
             breathing_phase_buffer: VecDeque::with_capacity(breathing_capacity.max(1)),
+            residual_buffer: VecDeque::with_capacity(breathing_capacity.max(1)),
             heartbeat_buffer: VecDeque::with_capacity(heartbeat_capacity.max(1)),
             sample_rate,
             breathing_window_secs,
@@ -262,6 +271,9 @@ impl VitalSignDetector {
             breathing_peak_ratio: breathing_ratio,
             heartbeat_peak_ratio: heartbeat_ratio,
             breathing_phase_peak_ratio: breathing_phase_ratio,
+            // Filled by `push_residual`, which the server calls with the
+            // calibrated residual when a field model is bound to this node.
+            residual_breathing_peak_ratio: self.last_evidence.residual_breathing_peak_ratio,
         };
 
         // -- Signal quality --
@@ -430,6 +442,32 @@ impl VitalSignDetector {
         } else {
             (None, confidence, peak_ratio)
         }
+    }
+
+    /// Feed the calibrated residual of one frame. Returns the current breathing
+    /// estimate taken from the residual buffer, if it is long enough.
+    pub fn push_residual(&mut self, residual: f64) -> Option<(f64, f64, f64)> {
+        if !residual.is_finite() || residual < 0.0 {
+            return None;
+        }
+        self.residual_buffer.push_back(residual);
+        while self.residual_buffer.len() > self.breathing_capacity {
+            self.residual_buffer.pop_front();
+        }
+        let (rate, confidence, ratio) = self.extract_residual_breathing_with_ratio();
+        self.last_evidence.residual_breathing_peak_ratio = ratio;
+        rate.map(|bpm| (bpm, confidence, ratio))
+    }
+
+    /// Breathing estimate from the calibrated residual, plus its raw ratio.
+    pub fn extract_residual_breathing_with_ratio(&self) -> (Option<f64>, f64, f64) {
+        if self.residual_buffer.len() < MIN_BREATHING_SAMPLES {
+            return (None, 0.0, 0.0);
+        }
+        let data: Vec<f64> = self.residual_buffer.iter().copied().collect();
+        let filtered =
+            bandpass_filter(&data, BREATHING_MIN_HZ, BREATHING_MAX_HZ, self.sample_rate);
+        self.compute_fft_peak_with_ratio(&filtered, BREATHING_MIN_HZ, BREATHING_MAX_HZ)
     }
 
     /// Spectral evidence behind the latest [`Self::process_frame`] call.

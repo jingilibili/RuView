@@ -420,11 +420,17 @@ function mainLoop(timestamp) {
   const presenceEl = document.getElementById('presence-value');
   const presenceSrcEl = document.getElementById('presence-source');
   if (presenceEl) {
+    // One source of truth: the server's classified presence, which is the union of
+    // motion evidence and the calibrated occupancy. Deriving a second verdict here
+    // from the count and the motion level made this page disagree with the
+    // observatory page on the same room (MEASURED: observatory PRESENT, this page
+    // EMPTY). Count and motion level are detail, not a competing verdict.
     const activity = csiSimulator.serverPresence;   // motion level, or null
     const occupants = csiSimulator.serverPersons || 0;
     const moving = !!activity && activity !== 'absent';
-    const occupied = occupants > 0 || moving;
-    if (activity === null && occupants === 0) {
+    const verdict = csiSimulator.serverPresenceVerdict;   // boolean, or null
+    const occupied = verdict === null ? null : verdict;
+    if (verdict === null) {
       presenceEl.textContent = '--';
       presenceEl.style.color = 'var(--amber)';
       if (presenceSrcEl) presenceSrcEl.textContent = 'awaiting live frames';
@@ -434,7 +440,7 @@ function mainLoop(timestamp) {
       if (presenceSrcEl) {
         presenceSrcEl.textContent = moving
           ? `moving: ${activity}`
-          : 'still — no movement';
+          : (occupants > 0 ? 'still — calibrated occupancy' : 'still — no movement');
       }
     } else {
       presenceEl.textContent = 'EMPTY';

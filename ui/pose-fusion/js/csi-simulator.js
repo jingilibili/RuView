@@ -51,6 +51,10 @@ export class CsiSimulator {
     // the demo case.
     this.serverPresence = null;
     this.serverPersons = 0;
+    // The server's classified presence: the union of motion evidence and the
+    // duty-cycle filtered calibrated occupancy. Both pages read this one field
+    // so they cannot disagree about the same room.
+    this.serverPresenceVerdict = null;
     // Published vitals from the sensing update (`null` while the ADR-021/ADR-293
     // gate abstains) and the gate's own explanation, fetched from
     // /api/v1/vital-signs so the page can say *why* there are no numbers.
@@ -122,6 +126,10 @@ export class CsiSimulator {
     this.socketOpen = false;
     this.serverPresence = null;
     this.serverPersons = 0;
+    // The server's classified presence: the union of motion evidence and the
+    // duty-cycle filtered calibrated occupancy. Both pages read this one field
+    // so they cannot disagree about the same room.
+    this.serverPresenceVerdict = null;
   }
 
   /** True only once a real frame has been decoded — not merely on socket open. */
@@ -453,6 +461,7 @@ export class CsiSimulator {
       }
       if (typeof cls.motion_level === 'string') this.serverPresence = cls.motion_level;
       this.serverPersons = typeof msg.estimated_persons === 'number' ? msg.estimated_persons : 0;
+      this.serverPresenceVerdict = typeof cls.presence === 'boolean' ? cls.presence : null;
       // Keep the last published value: the gate only opens on a minority of frames
       // (~9.5% MEASURED), so clearing on every message would hide numbers the
       // server is publishing. The age is carried alongside so the display can say

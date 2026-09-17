@@ -2017,12 +2017,23 @@ struct AppStateInner {
     engine_bridge: engine_bridge::EngineBridge,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
     field_model: Option<FieldModel>,
-    /// Leaky duty-cycle accumulator for occupancy, in seconds of evidence:
-    /// positive while a window reads occupied, negative while it reads
-    /// empty. See `observe_occupancy`.
-    occupancy_score: f64,
-    /// When `occupancy_score` was last advanced.
-    occupancy_score_updated: Option<std::time::Instant>,
+    /// Recent (instant, above-boundary) observations behind the sliding-window
+    /// duty cycle. See `observe_occupancy`.
+    occupancy_duty: std::collections::VecDeque<(std::time::Instant, bool)>,
+    /// Slow quiet floor of the residual, updated only while the room reads
+    /// quiet. Compensates the drift that would otherwise keep an empty room
+    /// reported as occupied. See `observe_occupancy`.
+    residual_quiet_floor: Option<f64>,
+    /// Boundary inflated by the quiet floor, in the same units as the field
+    /// model's residual. Reported and used for the drift-aware decision.
+    residual_boundary_effective: Option<f64>,
+    /// Per-node running sum and count of frames seen while the room was held
+    /// empty, used to build each node's residual baseline at finalization.
+    vitals_baseline_sum: HashMap<u8, Vec<f64>>,
+    vitals_baseline_count: HashMap<u8, usize>,
+    /// Per-node mean frame from the empty hold; the residual every later frame
+    /// is measured against. See `push_residual` on the detector.
+    vitals_baseline: HashMap<u8, Vec<f64>>,
     /// Spectral evidence gathered during the current empty-room collection.
     vitals_null: VitalsNullCollector,
     /// Per-node evidence summary from the last completed calibration.
@@ -2199,6 +2210,20 @@ impl AppStateInner {
     fn finish_vitals_null_floors(&mut self) {
         self.vitals_null_floors = self.vitals_null.summarize();
         self.vitals_null.clear();
+
+        // Turn the accumulated sums into per-node mean frames. Every node that
+        // streamed during the empty hold gets a baseline, so every node gets a
+        // residual breathing carrier.
+        self.vitals_baseline.clear();
+        for (node_id, sum) in self.vitals_baseline_sum.drain() {
+            let count = self.vitals_baseline_count.remove(&node_id).unwrap_or(0);
+            if count < 100 {
+                continue;
+            }
+            let mean: Vec<f64> = sum.iter().map(|total| total / count as f64).collect();
+            self.vitals_baseline.insert(node_id, mean);
+        }
+        self.vitals_baseline_count.clear();
     }
 
     fn maybe_feed_calibration_frame(
@@ -2225,6 +2250,20 @@ impl AppStateInner {
                 .map(|node| node.vital_detector.last_evidence())
                 .unwrap_or_default();
             self.vitals_null.observe(node_id, evidence);
+
+            // Accumulate this node's mean frame for its residual baseline.
+            if !amplitudes.is_empty() {
+                let sum = self
+                    .vitals_baseline_sum
+                    .entry(node_id)
+                    .or_insert_with(|| vec![0.0; amplitudes.len()]);
+                if sum.len() == amplitudes.len() {
+                    for (total, value) in sum.iter_mut().zip(amplitudes.iter()) {
+                        *total += *value;
+                    }
+                    *self.vitals_baseline_count.entry(node_id).or_insert(0) += 1;
+                }
+            }
         }
 
         let binding_matches = self.calibration_grid_binding.is_some_and(|binding| {
@@ -2407,41 +2446,97 @@ impl AppStateInner {
     /// `OCCUPANCY_DWELL_MS` before it is reported, which removes the 0 <-> 1
     /// flicker MEASURED in a still room while still registering a person who walks
     /// in within a couple of seconds.
-    fn observe_occupancy(&mut self, raw: usize, now: std::time::Instant) -> usize {
-        // Duty cycle, not peak. A person and an animal produce different sized
-        // peaks on this rig, but the peaks overlap: the longest burst measured
-        // in an empty room with three cats was 18 s, while a seated operator
-        // held the boundary 87.8 percent of the time with runs up to 36 s. A
-        // leaky accumulator over a fixed window separates the two by how much
-        // of the window reads occupied, which differs by an order of magnitude
-        // (87.8 percent against 9.2 percent).
-        let window = occupancy_ms_from_env(
+    fn observe_occupancy(
+        &mut self,
+        raw: usize,
+        quiet_residual: Option<f64>,
+        now: std::time::Instant,
+    ) -> usize {
+        // Duty cycle over a sliding window, not a leaky accumulator. MEASURED:
+        // a seated operator held the boundary 87.8 percent of the time while an
+        // empty room with three active cats held it 33-45 percent, so the two
+        // differ by roughly a factor of two in this measure. An accumulator was
+        // tried first and failed: once acquired it decayed only at
+        // (below_share - above_share) per second, so with cats at 40 percent it
+        // took minutes to reach the release line and the browser reported an
+        // occupant in a room full of cats. A sliding window carries no such
+        // memory and bounds the delay in both directions by one window.
+        let window_ms = occupancy_ms_from_env(
             "WDP_OCCUPANCY_DUTY_WINDOW_MS",
             OCCUPANCY_DUTY_WINDOW_MS,
-        ) as f64
-            / 1000.0;
-        let acquire = occupancy_ms_from_env(
-            "WDP_OCCUPANCY_DUTY_ACQUIRE_MS",
-            OCCUPANCY_DUTY_ACQUIRE_MS,
-        ) as f64
-            / 1000.0;
-        let release = occupancy_ms_from_env(
-            "WDP_OCCUPANCY_DUTY_RELEASE_MS",
-            OCCUPANCY_DUTY_RELEASE_MS,
-        ) as f64
-            / 1000.0;
-        // Capped so a pause in the feed cannot jump the score.
-        let dt = self
-            .occupancy_score_updated
-            .map(|last| now.saturating_duration_since(last).as_secs_f64().min(1.0))
-            .unwrap_or(0.0);
-        self.occupancy_score_updated = Some(now);
-        let step = if raw >= 1 { dt } else { -dt };
-        self.occupancy_score = (self.occupancy_score + step).clamp(-window, window);
-        if self.occupancy_score >= acquire {
+        );
+        let acquire_pct = occupancy_ms_from_env(
+            "WDP_OCCUPANCY_DUTY_ACQUIRE_PCT",
+            OCCUPANCY_DUTY_ACQUIRE_PCT,
+        )
+        .min(100) as f64
+            / 100.0;
+        let release_pct = occupancy_ms_from_env(
+            "WDP_OCCUPANCY_DUTY_RELEASE_PCT",
+            OCCUPANCY_DUTY_RELEASE_PCT,
+        )
+        .min(100) as f64
+            / 100.0;
+
+        let window = Duration::from_millis(window_ms);
+        self.occupancy_duty.push_back((now, raw >= 1));
+        while self
+            .occupancy_duty
+            .front()
+            .is_some_and(|(seen, _)| now.saturating_duration_since(*seen) > window)
+        {
+            self.occupancy_duty.pop_front();
+        }
+
+        // The span actually covered, so a half-filled window cannot report a
+        // duty cycle it has not observed yet.
+        let (span_s, above_s) = match (self.occupancy_duty.front(), self.occupancy_duty.back())
+        {
+            (Some((first, _)), Some((last, _))) => {
+                let span = last.saturating_duration_since(*first).as_secs_f64();
+                let mut above = 0.0_f64;
+                let mut previous: Option<(std::time::Instant, bool)> = None;
+                for (instant, is_above) in &self.occupancy_duty {
+                    if let Some((last_instant, last_above)) = previous {
+                        let dt = instant.saturating_duration_since(last_instant).as_secs_f64();
+                        if last_above {
+                            above += dt;
+                        }
+                    }
+                    previous = Some((*instant, *is_above));
+                }
+                (span, above)
+            }
+            _ => (0.0, 0.0),
+        };
+        let duty = if span_s > 0.0 { above_s / span_s } else { 0.0 };
+
+        // Only decide once the window is substantially filled, so a restart or a
+        // feed gap cannot acquire or release on a sliver of evidence.
+        let filled = span_s >= window.as_secs_f64() * 0.8;
+
+        // Drift compensation. MEASURED: over nine hours the room's residual
+        // drifted from p50 10 to p50 19, and an empty room afterwards stayed
+        // above the stored boundary in 85-100 percent of windows. The quiet
+        // floor follows that drift but is updated only while the room reads
+        // quiet, so a person present - whose duty stays high - never enters it.
+        if let Some(residual) = quiet_residual {
+            if filled && duty <= release_pct {
+                self.residual_quiet_floor = Some(match self.residual_quiet_floor {
+                    Some(floor) => floor + (residual - floor) * 0.05,
+                    None => residual,
+                });
+            }
+        }
+        if let Some(floor) = self.residual_quiet_floor {
+            self.residual_boundary_effective = Some(floor * 1.5);
+        }
+        if filled && duty >= acquire_pct {
             self.stable_occupancy = raw.max(1);
-        } else if self.occupancy_score <= -release {
-            self.stable_occupancy = 0;
+        } else if !filled || duty <= release_pct {
+            if self.stable_occupancy > 0 && (!filled || duty <= release_pct) {
+                self.stable_occupancy = 0;
+            }
         }
         self.stable_occupancy
     }
@@ -2611,8 +2706,12 @@ impl AppStateInner {
     /// build the training router without the full server boot.
     pub(crate) fn minimal() -> Self {
         AppStateInner {
-            occupancy_score: 0.0,
-            occupancy_score_updated: None,
+            occupancy_duty: std::collections::VecDeque::new(),
+            residual_quiet_floor: None,
+            residual_boundary_effective: None,
+            vitals_baseline_sum: HashMap::new(),
+            vitals_baseline_count: HashMap::new(),
+            vitals_baseline: HashMap::new(),
             vitals_null: VitalsNullCollector::default(),
             vitals_null_floors: HashMap::new(),
             latest_update: None,
@@ -3838,19 +3937,19 @@ const MOTION_NOISE_FLOOR_PRIOR: f64 = 0.03;
 /// a person sitting still: the eigenvalue estimate flipped between 0 and 1 every
 /// few seconds, which made vitals publication intermittent and the presence
 /// display flicker. Two seconds still registers a person walking in promptly.
-/// The leaky accumulator window used to measure duty cycle. MEASURED: a
-/// seated operator held the boundary 87.8 percent of the time over 41
-/// samples (longest run 36 s) while an empty room with three cats held it
-/// 9.2 percent over 437 samples (longest burst 18 s), so a plain dwell
-/// either admits a cat burst or delays a person. Override with
-/// WDP_OCCUPANCY_DUTY_WINDOW_MS.
+/// Sliding window over which the duty cycle is measured. MEASURED: a seated
+/// operator held the boundary 87.8 percent of the time while three active
+/// cats alone held it 33-45 percent, and one cat mostly still held it 9.2
+/// percent. Override with WDP_OCCUPANCY_DUTY_WINDOW_MS.
 const OCCUPANCY_DUTY_WINDOW_MS: u64 = 30_000;
-/// Accumulated above-boundary time that reports an occupant (70 percent
-/// of the window). Override with WDP_OCCUPANCY_DUTY_ACQUIRE_MS.
-const OCCUPANCY_DUTY_ACQUIRE_MS: u64 = 21_000;
-/// Accumulated below-boundary time that releases the occupant (50 percent
-/// of the window). Override with WDP_OCCUPANCY_DUTY_RELEASE_MS.
-const OCCUPANCY_DUTY_RELEASE_MS: u64 = 15_000;
+/// Duty cycle that reports an occupant. Sits between the seated operator at
+/// 87.8 percent and three active cats at 33-45 percent. Override with
+/// WDP_OCCUPANCY_DUTY_ACQUIRE_PCT.
+const OCCUPANCY_DUTY_ACQUIRE_PCT: u64 = 75;
+/// Duty cycle that releases the occupant, lower so a still person whose
+/// residual dips for a few seconds is not dropped. Override with
+/// WDP_OCCUPANCY_DUTY_RELEASE_PCT.
+const OCCUPANCY_DUTY_RELEASE_PCT: u64 = 40;
 
 /// Environment override for a positive millisecond setting.
 fn occupancy_ms_from_env(name: &str, fallback: u64) -> u64 {
@@ -7725,9 +7824,12 @@ mod bootstrap_vital_publication_tests {
         assert_eq!(evidence.rssi_median_dbm, Some(-27));
     }
 
-    /// MEASURED discriminator: an 18 s burst (the longest seen in an empty room
-    /// with three cats) and a cat-like duty cycle must not acquire an occupant,
-    /// while a person-like duty cycle must.
+    /// MEASURED discriminator, and the regression that forced a redesign: an 18 s
+    /// burst, a cat-like 9 percent cycle, and three active cats at 40 percent must
+    /// not report an occupant, while a person-like 88 percent cycle must - and the
+    /// release must follow within one window once the duty falls, which the leaky
+    /// accumulator could not do (it kept the browser lit for minutes in a room
+    /// holding only cats).
     #[test]
     fn occupancy_follows_duty_cycle_not_peaks() {
         let mut state = AppStateInner::minimal();
@@ -7735,7 +7837,7 @@ mod bootstrap_vital_publication_tests {
         let mut now = std::time::Instant::now();
 
         for _ in 0..36 {
-            state.observe_occupancy(1, now);
+            state.observe_occupancy(1, None, now);
             now += tick;
         }
         assert_eq!(
@@ -7743,21 +7845,40 @@ mod bootstrap_vital_publication_tests {
             "an 18 second burst must not be reported as an occupant"
         );
 
-        // A cat-like 9 percent duty cycle over 200 s must not acquire either.
         for index in 0..400 {
-            state.observe_occupancy(if index % 11 == 0 { 1 } else { 0 }, now);
+            state.observe_occupancy(if index % 11 == 0 { 1 } else { 0 }, None, now);
             now += tick;
         }
         assert_eq!(state.stable_occupancy, 0, "a cat-like duty cycle is not a person");
 
-        // A person-like 88 percent duty cycle must acquire.
+        // Three active cats: 40 percent duty, sustained for two minutes.
+        for index in 0..240 {
+            state.observe_occupancy(if index % 5 < 2 { 1 } else { 0 }, None, now);
+            now += tick;
+        }
+        assert_eq!(
+            state.stable_occupancy, 0,
+            "three active cats at 40 percent duty are not an occupant"
+        );
+
         for index in 0..200 {
-            state.observe_occupancy(if index % 8 == 0 { 0 } else { 1 }, now);
+            state.observe_occupancy(if index % 8 == 0 { 0 } else { 1 }, None, now);
             now += tick;
         }
         assert_eq!(
             state.stable_occupancy, 1,
             "a person-like duty cycle must be reported as an occupant"
+        );
+
+        // And the release must follow within one window once the cats are alone
+        // again: this is what the leaky accumulator could not do.
+        for index in 0..240 {
+            state.observe_occupancy(if index % 5 < 2 { 1 } else { 0 }, None, now);
+            now += tick;
+        }
+        assert_eq!(
+            state.stable_occupancy, 0,
+            "the occupant must be released within one window of cat-only evidence"
         );
     }
 
@@ -9204,6 +9325,9 @@ async fn calibration_reset(State(state): State<SharedState>) -> Json<serde_json:
     s.calibration_model_id = None;
     s.vitals_null.clear();
     s.vitals_null_floors.clear();
+    s.vitals_baseline_sum.clear();
+    s.vitals_baseline_count.clear();
+    s.vitals_baseline.clear();
     s.calibration_source_node_ids.clear();
     s.clear_field_model_binding();
     s.clear_calibration_sequence_state();
@@ -9390,6 +9514,13 @@ async fn vital_signs_diagnostics_endpoint(
             "heartbeat_peak_ratio": node.vital_detector.last_evidence().heartbeat_peak_ratio,
             "null_breathing_p95_ratio": s.vitals_null_floors.get(&node_id).map(|floor| floor.breathing_p95),
             "breathing_phase_ratio": node.vital_detector.last_evidence().breathing_phase_peak_ratio,
+            "residual_breathing_ratio": node.vital_detector.last_evidence().residual_breathing_peak_ratio,
+            "residual_breathing_bpm": node.vital_detector
+                .extract_residual_breathing_with_ratio()
+                .0,
+            "residual_breathing_confidence": node.vital_detector
+                .extract_residual_breathing_with_ratio()
+                .1,
             "null_breathing_phase_p95_ratio": s.vitals_null_floors.get(&node_id).map(|floor| floor.breathing_phase_p95),
             "breathing_phase_over_null": s.vitals_null_floors.get(&node_id).and_then(|floor| {
                 (floor.breathing_phase_p95 > f64::EPSILON).then_some(
@@ -10507,6 +10638,27 @@ async fn udp_receiver_task(
                         observed_at,
                     );
 
+                    // Breathing from each node's own calibrated residual. Every node
+                    // that streamed during the empty hold has a mean-frame baseline,
+                    // so all of them carry this carrier rather than only the field
+                    // model's bound link.
+                    if let Some(baseline) = s.vitals_baseline.get(&frame.node_id) {
+                        if baseline.len() == frame.amplitudes.len() {
+                            let residual: f64 = baseline
+                                .iter()
+                                .zip(frame.amplitudes.iter())
+                                .map(|(reference, value)| {
+                                    let delta = value - reference;
+                                    delta * delta
+                                })
+                                .sum::<f64>()
+                                .sqrt();
+                            if let Some(node_state) = s.node_states.get_mut(&frame.node_id) {
+                                node_state.vital_detector.push_residual(residual);
+                            }
+                        }
+                    }
+
                     // ── ADR-110 / issue #1005: per-node subcarrier-grid gate ──
                     // ESP32-C6 nodes interleave HE-SU 256-bin frames (~84%)
                     // with HT 64-bin frames on the same socket. HT-LTF and
@@ -10769,9 +10921,17 @@ async fn udp_receiver_task(
                             // publishing vitals because a chair moved.
                             Some(matched) if matched.matches_empty => Some(0),
                             _ => {
-                                let raw_count = s.person_count_at(observed_at_unix_ms);
+                                // Read the frame's residual before borrowing the state mutably.
+                    let quiet_residual = s
+                        .runtime_background_match(observed_at_unix_ms)
+                        .map(|matched| matched.residual_energy);
+                    let raw_count = s.person_count_at(observed_at_unix_ms);
                                 let occupancy_now = std::time::Instant::now();
-                                Some(s.observe_occupancy(raw_count, occupancy_now))
+                                Some(s.observe_occupancy(
+                                    raw_count,
+                                    quiet_residual,
+                                    occupancy_now,
+                                ))
                             }
                         }
                     } else {
@@ -12506,8 +12666,12 @@ async fn main() {
         // Empty-room vitals noise: gathered while a calibration holds the
         // room empty, summarized when that collection finalizes
         // (see VitalsNullCollector).
-        occupancy_score: 0.0,
-        occupancy_score_updated: None,
+        occupancy_duty: std::collections::VecDeque::new(),
+        residual_quiet_floor: None,
+        residual_boundary_effective: None,
+        vitals_baseline_sum: HashMap::new(),
+        vitals_baseline_count: HashMap::new(),
+        vitals_baseline: HashMap::new(),
         vitals_null: VitalsNullCollector::default(),
         vitals_null_floors: HashMap::new(),
         latest_update: None,
