@@ -2537,9 +2537,17 @@ impl AppStateInner {
         self.bootstrap_baseline_active && self.field_model_active_at(observed_at_unix_ms)
     }
 
+    /// Is an explicit calibration active and fresh, whether it was completed in
+    /// this process or restored from the persisted image?
+    ///
+    /// The operator's decision after using the rig: presence-only was wrong. A
+    /// restored calibration carries the same receipt identity, frame count and
+    /// expiry as the hold that produced it, so the numbers it authorizes are
+    /// still bound to an identified calibration. What bounds them is the node's
+    /// own measured empty-room ceiling, not whether the process restarted.
+    /// ADR-364 recorded the earlier narrowing; it now records this change.
     fn explicit_calibration_fresh_at(&self, observed_at_unix_ms: u64) -> bool {
         !self.bootstrap_baseline_active
-            && !self.restored_calibration_active
             && self.field_model_status_at(observed_at_unix_ms) == Some(CalibrationStatus::Fresh)
     }
 
@@ -3248,6 +3256,7 @@ mod publication_ceiling_tests {
     }
 }
 
+#[cfg(test)]
 mod calibration_expiry_tests {
     use super::*;
     use wifi_densepose_signal::ruvsense::field_model::FieldModelConfig;
@@ -3509,8 +3518,8 @@ mod calibration_expiry_tests {
     }
 
     /// ADR-364: a restart must not cost another empty hold, so a restored
-    /// calibration keeps publishing occupancy evidence - with the identity of
-    /// the hold that produced it - while numeric vitals stay abstained.
+    /// calibration keeps publishing occupancy evidence and authorizing numeric
+    /// vitals - both with the identity of the hold that produced it.
     #[test]
     fn a_restored_calibration_publishes_occupancy_evidence_and_not_vitals() {
         let mut state = state_with_receipt();
@@ -3529,8 +3538,8 @@ mod calibration_expiry_tests {
             "a restored calibration carries occupancy authority"
         );
         assert!(
-            !state.explicit_calibration_fresh_at(1_500),
-            "numeric vitals must stay gated on a hold completed in this process"
+            state.explicit_calibration_fresh_at(1_500),
+            "a restored calibration authorizes vitals as well as occupancy"
         );
 
         let evidence = state
@@ -3557,6 +3566,10 @@ mod calibration_expiry_tests {
 
         assert!(state.bootstrap_baseline_active);
         assert!(state.occupancy_calibration_active_at(1_500));
+        // The fixture deliberately holds both authorities at once, which the
+        // startup path never does (a restored image wins and the prior stays
+        // inactive). While the prior is the active one, the explicit gate stays
+        // closed: the prior can suppress but never authorize.
         assert!(!state.explicit_calibration_fresh_at(1_500));
     }
 
@@ -3590,10 +3603,7 @@ mod calibration_expiry_tests {
         assert_eq!(status["restored_calibration"]["stored"], true);
         assert_eq!(status["restored_calibration"]["active"], true);
         assert_eq!(status["restored_calibration"]["occupancy_authorized"], true);
-        assert_eq!(
-            status["restored_calibration"]["numeric_vitals_authorized"],
-            false
-        );
+        assert_eq!(status["restored_calibration"]["numeric_vitals_authorized"], true);
         assert_eq!(
             status["restored_calibration"]["authority"],
             calibration_persistence::EXPLICIT_CALIBRATION_AUTHORITY
@@ -9885,7 +9895,7 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
                     "expires_at_unix_ms": metadata.expires_at_unix_ms,
                     "content_sha256": metadata.content_sha256,
                     "occupancy_authorized": restored_active,
-                    "numeric_vitals_authorized": false,
+                    "numeric_vitals_authorized": restored_active,
                 })
             })
             .unwrap_or_else(|| {

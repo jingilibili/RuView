@@ -120,3 +120,23 @@ restart recovery is CLAIMED from unit tests and not MEASURED on hardware.
    process and a fresh restored image; numeric vitals keep using
    `explicit_calibration_fresh_at`.
 5. `calibration_reset` removes the image; `calibration_status` reports it.
+
+
+## Amendment: restored vitals authority (same day)
+
+The operator, after using the restored calibration on the rig, judged the
+presence-only boundary wrong: the dashboard showed no breathing and no heart
+rate, which are the numbers this rig exists to produce, and the reason was the
+process restart rather than the quality of the evidence.
+`explicit_calibration_fresh_at` no longer excludes a restored calibration, so a
+restored image authorizes numeric vitals as well as occupancy.
+
+Guards that remain: an explicit calibration with a complete receipt is still
+required, the image still expires with its model, the publication path still
+needs exactly one occupant with qualified signal quality and confidence, and
+once the ceiling gate is deployed each metric must clear its reporting node's
+own measured empty-room ceiling.
+
+CLAIMED, not MEASURED: that a restored calibration's numbers are as good as a
+fresh hold's is not yet shown. It needs the seated test repeated after a
+restart.
