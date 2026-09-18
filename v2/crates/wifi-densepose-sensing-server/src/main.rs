@@ -13887,7 +13887,7 @@ async fn main() {
                     info!(
                         model_id = %metadata.identity.model_id,
                         expires_at_unix_ms = metadata.expires_at_unix_ms,
-                        "Restored the completed room calibration; numeric vitals stay gated on a hold in this process"
+                        "Restored the completed room calibration, with occupancy and numeric vitals authority"
                     );
                     Some((model, metadata))
                 }

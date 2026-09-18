@@ -105,8 +105,17 @@ def take_hold(base, label, limit, assume_yes):
     print("== preflight ==")
     reference = describe_status(status)
     if status.get("active") and reference.get("residual_reference_p95") is not None:
-        print("  a calibration is already finalized; reset it before taking another hold")
-        return 2
+        # A finalized calibration blocks a new hold. Resetting is part of taking
+        # one, so the tool does it instead of asking the operator to run curl.
+        print("  a calibration is already finalized; resetting before the new hold")
+        reset = call(base, "/api/v1/calibration/reset", {
+            "boot_epoch": status.get("boot_epoch"),
+            "session_id": None,
+            "binding_digest": None,
+            "source_node_ids": None,
+        })
+        print("  reset:", json.dumps({k: v for k, v in reset.items() if k != "message"})[:160])
+        time.sleep(10)
 
     if not assume_yes:
         print("\nThe room must stay empty for the whole hold, and the room binding is")
