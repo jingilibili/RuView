@@ -59,8 +59,80 @@ pub struct BreathingExtractor {
     /// of starting from a clean window (issue #1422). Once
     /// `consecutive_rejections` reaches `STALE_RESET_REJECTIONS`, `reset()`
     /// is called so the next accepted estimate is built from fresh data
-    /// only, instead of waiting out the old window.
     consecutive_rejections: usize,
+    /// Decimated window of per-subcarrier residuals, kept so the selector can
+    /// measure which subcarriers actually carry breathing-band power. Bounded
+    /// by the same window capacity as the estimate; `reset()` deliberately
+    /// keeps it, because subcarrier sensitivity is a property of the link and
+    /// the subject's position, not of one estimate window.
+    residual_history: VecDeque<Vec<f64>>,
+    /// Weights from the last selection pass, or `None` until there is enough
+    /// history. `None` means the caller's weights are used unchanged.
+    selected_weights: Option<Vec<f64>>,
+    /// Samples until the next selection pass.
+    selection_countdown: usize,
+}
+
+/// Samples between subcarrier selection passes.
+const SELECTION_INTERVAL_S: f64 = 1.0;
+/// Decimated rate the selector works at: enough for a 0.1 to 0.5 Hz band, far
+/// cheaper than the full input rate.
+const SELECTION_RATE_HZ: f64 = 25.0;
+/// Minimum decimated samples before a selection pass is meaningful.
+const SELECTION_MIN_SAMPLES: usize = 64;
+
+/// Power of `samples` at `freq_hz` (a single Goertzel probe), normalized by the
+/// sample count so subcarriers of different history lengths compare directly.
+fn band_power_at(samples: &[f64], sample_rate: f64, freq_hz: f64) -> f64 {
+    if samples.is_empty() || sample_rate <= 0.0 {
+        return 0.0;
+    }
+    let omega = std::f64::consts::TAU * freq_hz / sample_rate;
+    let (mut re, mut im) = (0.0_f64, 0.0_f64);
+    for (index, value) in samples.iter().enumerate() {
+        let phase = omega * index as f64;
+        re += value * phase.cos();
+        im += value * phase.sin();
+    }
+    (re * re + im * im) / samples.len() as f64
+}
+
+/// Weights that keep the subcarriers whose own power at `freq_hz` is above the
+/// median subcarrier, or `None` when there is too little history to judge.
+///
+/// A single sensitive subcarrier would otherwise be averaged away by the
+/// insensitive majority, which is the failure this selection exists to remove.
+fn select_breathing_subcarriers(
+    frames: &VecDeque<Vec<f64>>,
+    sample_rate: f64,
+    freq_hz: f64,
+) -> Option<Vec<f64>> {
+    let first = frames.front()?;
+    let n = first.len();
+    if n == 0 || frames.len() < SELECTION_MIN_SAMPLES {
+        return None;
+    }
+    let stride = (sample_rate / SELECTION_RATE_HZ).round().max(1.0) as usize;
+    let decimated_rate = sample_rate / stride as f64;
+
+    let mut powers = vec![0.0_f64; n];
+    for (slot, power) in powers.iter_mut().enumerate() {
+        let series: Vec<f64> = frames
+            .iter()
+            .step_by(stride)
+            .filter_map(|frame| frame.get(slot).copied())
+            .collect();
+        *power = band_power_at(&series, decimated_rate, freq_hz);
+    }
+
+    let mut sorted = powers.clone();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let median = sorted[sorted.len() / 2];
+    let keep = powers
+        .iter()
+        .map(|power| f64::from(u8::from(*power > median && *power > f64::EPSILON)))
+        .collect::<Vec<f64>>();
+    (keep.iter().any(|weight| *weight > 0.0)).then_some(keep)
 }
 
 /// Number of consecutive out-of-band rejections after which the sliding
@@ -89,6 +161,9 @@ impl BreathingExtractor {
             freq_high: 0.5,
             filter_state: IirState::default(),
             consecutive_rejections: 0,
+            residual_history: VecDeque::with_capacity(capacity),
+            selected_weights: None,
+            selection_countdown: 0,
         }
     }
 
@@ -113,9 +188,23 @@ impl BreathingExtractor {
             return None;
         }
 
+        // Keep a bounded, decimated-enough view of the per-subcarrier residuals
+        // so the selector can measure which subcarriers carry breathing power.
+        if self.residual_history.len() == self.residual_history.capacity() {
+            self.residual_history.pop_front();
+        }
+        self.residual_history.push_back(residuals[..n].to_vec());
+
         // Weighted fusion of subcarrier residuals (normalized — see
-        // `fuse_weighted_residuals`).
-        let weighted_signal = fuse_weighted_residuals(residuals, weights, n);
+        // `fuse_weighted_residuals`). The selector's weights replace the
+        // caller's once it has enough history and a frequency to probe; until
+        // then the caller's weights are used unchanged.
+        let selection_weights = self.selected_weights.as_deref();
+        let weighted_signal = fuse_weighted_residuals(
+            residuals,
+            selection_weights.unwrap_or(weights),
+            n,
+        );
 
         // Apply IIR bandpass filter
         let filtered = self.bandpass_filter(weighted_signal);
@@ -172,6 +261,17 @@ impl BreathingExtractor {
             return None;
         }
         self.consecutive_rejections = 0;
+
+        // Re-select the subcarriers behind this estimate, at most once per
+        // second: the frequency just accepted is the one worth probing.
+        let interval = (self.sample_rate * SELECTION_INTERVAL_S).round().max(1.0) as usize;
+        if self.selection_countdown == 0 {
+            self.selected_weights =
+                select_breathing_subcarriers(&self.residual_history, self.sample_rate, frequency_hz);
+            self.selection_countdown = interval;
+        } else {
+            self.selection_countdown = self.selection_countdown.saturating_sub(1);
+        }
 
         let bpm = frequency_hz * 60.0;
         let confidence = compute_confidence(history, frequency_hz, self.sample_rate);
@@ -337,6 +437,71 @@ fn compute_confidence(history: &[f64], frequency_hz: f64, sample_rate: f64) -> f
     let observed_cycles = history.len() as f64 / period_samples as f64;
     let cycle_coverage = (observed_cycles - 1.0).clamp(0.0, 1.0);
     (regularity * cycle_coverage).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    /// One sensitive subcarrier among noise must survive the selection, which is
+    /// the case the rig kept failing: MEASURED, every node's breathing ratio
+    /// against its own empty-room ceiling stayed between 0.56 and 1.24.
+    #[test]
+    fn selection_keeps_the_subcarrier_that_carries_the_breathing_band() {
+        let sample_rate = 100.0;
+        let freq = 0.25;
+        let mut frames: VecDeque<Vec<f64>> = VecDeque::new();
+        let mut noise = 0.5_f64;
+        for index in 0..300 {
+            let t = index as f64 / sample_rate;
+            noise = (noise * 1.37 + 0.11).fract();
+            let sensitive = (std::f64::consts::TAU * freq * t).sin();
+            let frame: Vec<f64> = (0..8)
+                .map(|slot| if slot == 3 { sensitive } else { noise - 0.5 })
+                .collect();
+            frames.push_back(frame);
+        }
+
+        let weights = select_breathing_subcarriers(&frames, sample_rate, freq).expect("selection");
+        assert_eq!(weights.len(), 8);
+        assert_eq!(weights[3], 1.0, "the modulated subcarrier must be kept");
+        assert!(
+            weights.iter().filter(|weight| **weight > 0.0).count() <= 3,
+            "noise subcarriers must not all be kept: {weights:?}"
+        );
+    }
+
+    /// Too little history must fall back to the caller's weights, not to an
+    /// invented selection.
+    #[test]
+    fn selection_abstains_without_enough_history() {
+        let mut frames: VecDeque<Vec<f64>> = VecDeque::new();
+        frames.push_back(vec![1.0, 2.0, 3.0]);
+        assert!(select_breathing_subcarriers(&frames, 100.0, 0.25).is_none());
+    }
+
+    /// A pure breathing tone must still produce a plausible rate through the
+    /// extractor once the selector is active.
+    #[test]
+    fn extractor_reports_a_plausible_rate_with_selection_active() {
+        let mut extractor = BreathingExtractor::new(8, 100.0, 30.0);
+        let freq = 0.25;
+        let mut estimate = None;
+        for index in 0..2000 {
+            let t = index as f64 / 100.0;
+            let value = (std::f64::consts::TAU * freq * t).sin();
+            let frame = vec![value; 8];
+            if let Some(value) = extractor.extract(&frame, &[]) {
+                estimate = Some(value);
+            }
+        }
+        let estimate = estimate.expect("a steady tone must be estimated");
+        assert!(
+            (estimate.value_bpm - 15.0).abs() < 6.0,
+            "0.25 Hz is 15 bpm: {}",
+            estimate.value_bpm
+        );
+    }
 }
 
 #[cfg(test)]
