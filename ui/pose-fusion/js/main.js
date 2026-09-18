@@ -4,12 +4,12 @@
  * Main orchestration: video capture → CNN embedding → CSI processing → fusion → rendering
  */
 
-import { VideoCapture } from './video-capture.js?v=13';
-import { CsiSimulator } from './csi-simulator.js?v=13';
-import { CnnEmbedder } from './cnn-embedder.js?v=13';
-import { FusionEngine } from './fusion-engine.js?v=13';
-import { PoseDecoder } from './pose-decoder.js?v=13';
-import { CanvasRenderer } from './canvas-renderer.js?v=13';
+import { VideoCapture } from './video-capture.js?v=15';
+import { CsiSimulator } from './csi-simulator.js?v=15';
+import { CnnEmbedder } from './cnn-embedder.js?v=15';
+import { FusionEngine } from './fusion-engine.js?v=15';
+import { PoseDecoder } from './pose-decoder.js?v=15';
+import { CanvasRenderer } from './canvas-renderer.js?v=15';
 import { withWsTicket } from '../../services/ws-ticket.js';
 import { vitalsView } from '../../services/vitals-view.js';
 
@@ -239,7 +239,7 @@ async function startCamera() {
  * unconditionally; saying EMPTY is the honest output, and it is also what makes
  * an occupancy regression visible at a glance.
  */
-function drawNoPose(ctx, canvas, serverPresence) {
+function drawNoPose(ctx, canvas, presenceVerdict) {
   ctx.save();
   // Start from an identity transform: a previous draw may have left a rotation or
   // translation behind, and this function must not inherit it.
@@ -253,13 +253,17 @@ function drawNoPose(ctx, canvas, serverPresence) {
   ctx.scale(-1, 1);
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  const empty = serverPresence === 'absent';
-  ctx.fillStyle = empty ? 'rgba(255,176,32,0.9)' : 'rgba(150,150,150,0.75)';
+  // The verdict is the server's boolean, not the motion level: a still occupant
+  // reads present with absent motion, and the panel beside this canvas says so.
+  const absent = presenceVerdict === false;
+  ctx.fillStyle = absent ? 'rgba(255,176,32,0.9)' : 'rgba(150,150,150,0.75)';
   ctx.font = '600 15px "JetBrains Mono", ui-monospace, monospace';
-  ctx.fillText(empty ? 'EMPTY — NO PRESENCE' : 'NO POSE DATA', canvas.width / 2, canvas.height / 2 - 8);
+  ctx.fillText(absent ? 'EMPTY — NO PRESENCE' : 'NO POSE DATA', canvas.width / 2, canvas.height / 2 - 8);
   ctx.font = '11px "JetBrains Mono", ui-monospace, monospace';
-  ctx.fillText(empty ? 'server room verdict: absent' : 'waiting for a presence verdict',
-               canvas.width / 2, canvas.height / 2 + 12);
+  const detail = absent
+    ? 'server room verdict: absent'
+    : (presenceVerdict === true ? 'occupied — no pose from CSI yet' : 'waiting for a presence verdict');
+  ctx.fillText(detail, canvas.width / 2, canvas.height / 2 + 12);
   ctx.restore();
 }
 
@@ -388,12 +392,19 @@ function mainLoop(timestamp) {
   };
 
   // --- Presence gate ---
-  // The server's room verdict (ADR-297) has authority over the pose: an empty
-  // room must not render a skeleton. Without this, the through-wall branch keeps
-  // coasting on the last body state while the CSI presence estimate is stale.
-  const serverAbsent = csiSimulator.serverPresence === 'absent';
+  // The server's classified presence has authority over the pose, and it is the
+  // *same* verdict the presence panel beside this canvas shows: the union of
+  // motion evidence and the duty-cycle filtered calibrated occupancy. Only an
+  // explicit absent verdict suppresses a skeleton.
+  //
+  // MEASURED (room B, seated operator): every node reported
+  // `motion_level: absent` while the calibrated occupancy read 1, so gating on
+  // the motion level drew "EMPTY — NO PRESENCE" here while the panel said
+  // PRESENT. An unknown verdict (no frame yet) is not an absent room, so it must
+  // not clear the track either.
+  const presenceVerdict = csiSimulator.serverPresenceVerdict;   // boolean, or null
   let keypoints = [];
-  if (serverAbsent) {
+  if (presenceVerdict === false) {
     poseDecoder.clearTrack();
   } else {
     keypoints = poseDecoder.decode(fusedEmb, motionRegion, elapsed, csiState);
@@ -408,7 +419,7 @@ function mainLoop(timestamp) {
       label: labelMap[mode]
     });
   } else {
-    drawNoPose(skeletonCtx, skeletonCanvas, csiSimulator.serverPresence);
+    drawNoPose(skeletonCtx, skeletonCanvas, csiSimulator.serverPresenceVerdict);
   }
 
   // --- Presence readout ---
