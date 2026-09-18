@@ -330,6 +330,162 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), ExplicitCalibra
     Ok(())
 }
 
+/// Schema of the empty-room floor image that travels beside the model.
+pub const NULL_FLOORS_SCHEMA: &str = "ruview.calibration.empty-room-floors.v1";
+const MAX_FLOORS_BYTES: u64 = 65_536;
+const MAX_NULL_FLOORS: usize = 16;
+
+/// Per-node empty-room noise summary of the hold that produced the model.
+///
+/// The publication path withholds a metric unless it clears the reporting
+/// node's own measured noise, so a restored calibration without these floors
+/// could not authorize a number at all.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistedNullFloor {
+    pub node_id: u8,
+    pub samples: usize,
+    pub breathing_p50: f64,
+    pub breathing_p95: f64,
+    pub breathing_phase_p50: f64,
+    pub breathing_phase_p95: f64,
+    pub heartbeat_p50: f64,
+    pub heartbeat_p95: f64,
+}
+
+impl PersistedNullFloor {
+    /// Usable only when every percentile is finite and non-negative: a NaN
+    /// would disable a ceiling silently.
+    fn is_plausible(&self) -> bool {
+        let values = [
+            self.breathing_p50,
+            self.breathing_p95,
+            self.breathing_phase_p50,
+            self.breathing_phase_p95,
+            self.heartbeat_p50,
+            self.heartbeat_p95,
+        ];
+        self.samples > 0 && values.iter().all(|value| value.is_finite() && *value >= 0.0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct FloorsPayloadV1 {
+    schema: String,
+    installation_binding_sha256: String,
+    model_id: String,
+    created_at_unix_ms: u64,
+    floors: Vec<PersistedNullFloor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct FloorsImageV1 {
+    payload: FloorsPayloadV1,
+    content_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FloorsImageRawV1 {
+    payload: Box<RawValue>,
+    content_sha256: String,
+}
+
+pub fn floors_path_in(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("calibration")
+        .join("explicit-empty-room-floors-v1.json")
+}
+
+/// Write the floors of a completed hold. Bound to the installation and to the
+/// model id of the calibration they belong to.
+pub fn store_null_floors(
+    path: &Path,
+    installation_id: &str,
+    model_id: &str,
+    floors: &[PersistedNullFloor],
+    created_at_unix_ms: u64,
+) -> Result<(), ExplicitCalibrationError> {
+    if floors.len() > MAX_NULL_FLOORS
+        || floors.iter().any(|floor| !floor.is_plausible())
+        || model_id.trim().is_empty()
+        || model_id.len() > MAX_ID_CHARS
+    {
+        return Err(ExplicitCalibrationError::Malformed(
+            "empty room floors".to_string(),
+        ));
+    }
+    let payload = FloorsPayloadV1 {
+        schema: NULL_FLOORS_SCHEMA.to_string(),
+        installation_binding_sha256: installation_binding(installation_id)
+            .map_err(|_| ExplicitCalibrationError::MissingInstallationId)?,
+        model_id: model_id.to_string(),
+        created_at_unix_ms,
+        floors: floors.to_vec(),
+    };
+    let image = FloorsImageV1 {
+        content_sha256: hex_sha256(&serde_json::to_vec(&payload)?),
+        payload,
+    };
+    let bytes = serde_json::to_vec(&image)?;
+    if bytes.len() as u64 > MAX_FLOORS_BYTES {
+        return Err(ExplicitCalibrationError::FileTooLarge);
+    }
+    atomic_write_private(path, &bytes)
+}
+
+/// Read the floors of the calibration with this model id. Anything that does not
+/// verify is refused whole: wrong schema, another installation, another model,
+/// a broken digest, an oversized file.
+pub fn load_null_floors(
+    path: &Path,
+    installation_id: &str,
+    model_id: &str,
+) -> Result<Vec<PersistedNullFloor>, ExplicitCalibrationError> {
+    let file_metadata = fs::symlink_metadata(path)?;
+    if file_metadata.file_type().is_symlink() || !file_metadata.is_file() {
+        return Err(ExplicitCalibrationError::InvalidPath);
+    }
+    if file_metadata.len() > MAX_FLOORS_BYTES {
+        return Err(ExplicitCalibrationError::FileTooLarge);
+    }
+    let mut bytes = Vec::with_capacity(file_metadata.len() as usize);
+    OpenOptions::new()
+        .read(true)
+        .open(path)?
+        .take(MAX_FLOORS_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FLOORS_BYTES {
+        return Err(ExplicitCalibrationError::FileTooLarge);
+    }
+    let raw: FloorsImageRawV1 = serde_json::from_slice(&bytes)?;
+    if hex_sha256(raw.payload.get().as_bytes()) != raw.content_sha256 {
+        return Err(ExplicitCalibrationError::DigestMismatch);
+    }
+    let payload: FloorsPayloadV1 = serde_json::from_str(raw.payload.get())?;
+    let malformed = |field: &str| ExplicitCalibrationError::Malformed(field.to_string());
+    if payload.schema != NULL_FLOORS_SCHEMA {
+        return Err(malformed("schema"));
+    }
+    if payload.installation_binding_sha256
+        != installation_binding(installation_id)
+            .map_err(|_| ExplicitCalibrationError::MissingInstallationId)?
+    {
+        return Err(ExplicitCalibrationError::InstallationMismatch);
+    }
+    if payload.model_id != model_id {
+        return Err(ExplicitCalibrationError::InstallationMismatch);
+    }
+    if payload.floors.len() > MAX_NULL_FLOORS
+        || payload.floors.iter().any(|floor| !floor.is_plausible())
+    {
+        return Err(malformed("floors"));
+    }
+    Ok(payload.floors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

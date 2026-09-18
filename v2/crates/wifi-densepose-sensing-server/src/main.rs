@@ -2859,11 +2859,41 @@ impl AppStateInner {
             field_model,
             created_at_unix_ms,
         ) {
-            Ok(metadata) => info!(
-                model_id = %metadata.identity.model_id,
-                expires_at_unix_ms = metadata.expires_at_unix_ms,
-                "Persisted the completed calibration for restart recovery"
-            ),
+            Ok(metadata) => {
+                // The floors travel beside the model: without them the
+                // empty-room ceiling gate has nothing to compare a metric
+                // against after a restart, and it fails closed by design.
+                let floors: Vec<calibration_persistence::PersistedNullFloor> = self
+                    .vitals_null_floors
+                    .iter()
+                    .map(|(node_id, floor)| calibration_persistence::PersistedNullFloor {
+                        node_id: *node_id,
+                        samples: floor.samples,
+                        breathing_p50: floor.breathing_p50,
+                        breathing_p95: floor.breathing_p95,
+                        breathing_phase_p50: floor.breathing_phase_p50,
+                        breathing_phase_p95: floor.breathing_phase_p95,
+                        heartbeat_p50: floor.heartbeat_p50,
+                        heartbeat_p95: floor.heartbeat_p95,
+                    })
+                    .collect();
+                let floors_path = calibration_persistence::floors_path_in(&self.data_dir);
+                if let Err(error) = calibration_persistence::store_null_floors(
+                    &floors_path,
+                    installation_id,
+                    &metadata.identity.model_id,
+                    &floors,
+                    created_at_unix_ms,
+                ) {
+                    warn!(%error, "Could not persist the empty-room floors");
+                }
+                info!(
+                    model_id = %metadata.identity.model_id,
+                    floors = floors.len(),
+                    expires_at_unix_ms = metadata.expires_at_unix_ms,
+                    "Persisted the completed calibration for restart recovery"
+                )
+            }
             Err(error) => warn!(%error, "Could not persist the completed calibration"),
         }
     }
@@ -10582,6 +10612,10 @@ async fn calibration_reset(
     s.calibration_model_id = None;
     // A reset removes the persisted calibration too, or the next restart would
     // resurrect exactly what the operator just cleared (ADR-364).
+    let floors_path = calibration_persistence::floors_path_in(&s.data_dir);
+    if let Err(error) = calibration_persistence::remove(&floors_path) {
+        warn!(%error, "Could not remove the persisted empty-room floors during reset");
+    }
     let restored_path = calibration_persistence::path_in(&s.data_dir);
     let restored_removed = match calibration_persistence::remove(&restored_path) {
         Ok(removed) => removed,
@@ -13909,6 +13943,37 @@ async fn main() {
         Some((model, metadata)) => (Some(model), Some(metadata)),
         None => (None, None),
     };
+    // The empty-room floors the hold measured travel beside the image; without
+    // them the ceiling gate could not judge a metric after a restart.
+    let restored_null_floors: Vec<calibration_persistence::PersistedNullFloor> =
+        match () {
+            _ if args.calibrate => Vec::new(),
+            _ => match (args.installation_id.as_deref(), restored_metadata.as_ref()) {
+                (Some(installation_id), Some(metadata)) => {
+                    let path = calibration_persistence::floors_path_in(&data_dir);
+                    match calibration_persistence::load_null_floors(
+                        &path,
+                        installation_id,
+                        &metadata.identity.model_id,
+                    ) {
+                        Ok(floors) => {
+                            info!(floors = floors.len(), "Restored the empty-room floors");
+                            floors
+                        }
+                        Err(calibration_persistence::ExplicitCalibrationError::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            Vec::new()
+                        }
+                        Err(error) => {
+                            warn!(%error, "Ignored invalid empty-room floors");
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            },
+        };
     info!(
         "Loaded runtime config: dedup_factor={:.2}",
         runtime_config.dedup_factor
@@ -14020,7 +14085,25 @@ async fn main() {
         vitals_baseline_count: HashMap::new(),
         vitals_baseline: HashMap::new(),
         vitals_null: VitalsNullCollector::default(),
-        vitals_null_floors: HashMap::new(),
+        // Floors restored with the model (ADR-364 amendment): the ceiling gate
+        // needs them to judge a metric after a restart.
+        vitals_null_floors: restored_null_floors
+            .iter()
+            .map(|floor| {
+                (
+                    floor.node_id,
+                    VitalsNullFloor {
+                        samples: floor.samples,
+                        breathing_p50: floor.breathing_p50,
+                        breathing_p95: floor.breathing_p95,
+                        breathing_phase_p50: floor.breathing_phase_p50,
+                        breathing_phase_p95: floor.breathing_phase_p95,
+                        heartbeat_p50: floor.heartbeat_p50,
+                        heartbeat_p95: floor.heartbeat_p95,
+                    },
+                )
+            })
+            .collect(),
         latest_update: None,
         rssi_history: VecDeque::new(),
         frame_history: VecDeque::new(),
