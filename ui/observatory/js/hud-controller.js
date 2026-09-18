@@ -10,6 +10,8 @@
  * - Quick-select scenario dropdown
  */
 
+import { presenceEvidenceOf } from '../../services/presence-evidence.js';
+
 // ---- Constants ----
 
 export const SCENARIO_NAMES = [
@@ -421,9 +423,11 @@ export class HudController {
     this._setText('var-value', (feat.variance || 0).toFixed(2));
     this._setText('motion-value', (feat.motion_band_power || 0).toFixed(3));
 
-    // Mini person-count dots
-    const personCount = data.estimated_persons || 0;
-    this._updatePersonDots(personCount);
+    // Mini person-count dots — the server's presence evidence names the
+    // authority behind the count, and a verdict that motion evidence asserted
+    // claims none, so the dots must not invent one.
+    const presence = presenceEvidenceOf(data);
+    this._updatePersonDots(presence.persons);
 
     const presEl = document.getElementById('presence-indicator');
     const presLabel = document.getElementById('presence-label');
@@ -431,7 +435,7 @@ export class HudController {
       const ml = cls.motion_level || 'absent';
       presEl.className = 'presence-state';
       if (ml === 'active') { presEl.classList.add('presence--active'); presLabel.textContent = 'ACTIVE'; }
-      else if (cls.presence) { presEl.classList.add('presence--present'); presLabel.textContent = 'PRESENT'; }
+      else if (presence.presence) { presEl.classList.add('presence--present'); presLabel.textContent = 'PRESENT'; }
       else { presEl.classList.add('presence--absent'); presLabel.textContent = 'ABSENT'; }
     }
 

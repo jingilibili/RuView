@@ -407,10 +407,16 @@ struct CalibrationModelReceipt {
     completed_at_unix_ms: u64,
 }
 
-/// Per-frame occupancy result bound to one immutable field-model calibration
-/// receipt. Absent whenever the model is stale, unavailable, or cannot score
-/// the current observation without a heuristic fallback, so a consumer can
-/// never mistake a fallback for calibrated evidence.
+/// Per-frame presence evidence bound to one immutable field-model calibration
+/// receipt. Absent whenever the model is stale or the observation cannot be
+/// attributed to a bound calibration, so a consumer can never mistake an
+/// unattributed value for evidence.
+///
+/// `presence` is the same verdict `classification.presence` publishes: motion
+/// evidence unioned with the duty-cycle filtered calibrated occupancy. Read
+/// `presence_authority` before `person_count` — a verdict asserted by motion
+/// carries no count (`person_count: 0` means "not claimed", not "empty"), so
+/// the count is never a second, competing verdict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CalibratedPresenceEvidence {
     schema: String,
@@ -423,9 +429,19 @@ struct CalibratedPresenceEvidence {
     inference_node_id: u8,
     source_tick: u64,
     observed_at_unix_ms: u64,
+    /// The scoring chain that produced the verdict: the calibrated occupancy
+    /// method plus this fork's duty-cycle union filter, `motion_evidence` when
+    /// only motion asserted presence, or `unavailable`.
     inference_method: String,
     presence: bool,
     person_count: usize,
+    /// `calibrated_occupancy`, `motion_evidence`, or `none`.
+    presence_authority: String,
+    /// Share of the verdict window that read as occupied, and the window
+    /// length: the basis of a duty-cycle verdict, published so the filter can
+    /// be audited instead of trusted.
+    duty_share: f64,
+    duty_window_ms: u64,
 }
 
 /// Sensing update broadcast to WebSocket clients
@@ -2089,6 +2105,10 @@ struct AppStateInner {
     /// Recent (instant, above-boundary) observations behind the sliding-window
     /// duty cycle. See `observe_occupancy`.
     occupancy_duty: std::collections::VecDeque<(std::time::Instant, bool)>,
+    /// Duty-cycle share of that window and the window length, kept so presence
+    /// evidence can publish the basis of the verdict. See `observe_occupancy`.
+    occupancy_duty_share: f64,
+    occupancy_duty_window_ms: u64,
     /// Slow quiet floor of the residual, updated only while the room reads
     /// quiet. Compensates the drift that would otherwise keep an empty room
     /// reported as occupied. See `observe_occupancy`.
@@ -2612,6 +2632,11 @@ impl AppStateInner {
             _ => (0.0, 0.0),
         };
         let duty = if span_s > 0.0 { above_s / span_s } else { 0.0 };
+        // Published with every evidence object so the verdict's own basis is
+        // auditable; the window length travels with the share because both are
+        // operator-settable (`WDP_OCCUPANCY_DUTY_*`).
+        self.occupancy_duty_share = duty;
+        self.occupancy_duty_window_ms = window_ms;
 
         // Only decide once the window is substantially filled, so a restart or a
         // feed gap cannot acquire or release on a sliver of evidence.
@@ -2683,10 +2708,18 @@ impl AppStateInner {
         }
     }
 
-    /// Strict per-frame calibrated occupancy evidence bound to the active
-    /// model receipt. Returns `None` unless an explicit calibration is fresh
-    /// and the field model scores the observation without falling back to the
-    /// heuristic, so a consumer may treat a present value as calibrated.
+    /// Per-frame presence evidence bound to the active model receipt.
+    ///
+    /// Returns `None` unless an explicit calibration is fresh and carries a
+    /// complete receipt, because evidence without identity cannot be audited.
+    /// The verdict itself is this fork's published one — motion evidence
+    /// unioned with the duty-cycle filtered calibrated occupancy — so the
+    /// frame never carries two presence verdicts that could disagree.
+    ///
+    /// A count is only claimed when the field model scored the window
+    /// (`calibrated_occupancy` is fail-closed on freshness and returns nothing
+    /// for an empty history), so `person_count` is either the filtered
+    /// calibrated count or zero with `presence_authority: motion_evidence`.
     fn calibrated_presence_evidence(
         &self,
         inference_node_id: u8,
@@ -2697,11 +2730,27 @@ impl AppStateInner {
             return None;
         }
         let receipt = self.calibration_model_receipt.as_ref()?;
-        let occupancy = field_bridge::calibrated_occupancy(
+        let calibrated = field_bridge::calibrated_occupancy(
             self.field_model.as_ref()?,
             self.scoring_history(),
             observed_at_unix_ms.saturating_mul(1_000),
-        )?;
+        );
+        let calibrated_present = calibrated.is_some() && self.stable_occupancy > 0;
+        let motion_present = self.room_debounced_level != "absent";
+        let presence_authority = if calibrated_present {
+            "calibrated_occupancy"
+        } else if motion_present {
+            "motion_evidence"
+        } else {
+            "none"
+        };
+        let inference_method = match (calibrated_present, calibrated.as_ref()) {
+            (true, Some(occupancy)) => {
+                format!("{}+duty_cycle_union_v1", occupancy.method.wire_name())
+            }
+            _ if motion_present => "motion_evidence".to_string(),
+            _ => "unavailable".to_string(),
+        };
         Some(CalibratedPresenceEvidence {
             schema: field_bridge::CALIBRATED_PRESENCE_EVIDENCE_SCHEMA.to_string(),
             boot_epoch: receipt.boot_epoch.clone(),
@@ -2713,9 +2762,16 @@ impl AppStateInner {
             inference_node_id,
             source_tick,
             observed_at_unix_ms,
-            inference_method: occupancy.method.wire_name().to_string(),
-            presence: occupancy.person_count > 0,
-            person_count: occupancy.person_count,
+            inference_method,
+            presence: calibrated_present || motion_present,
+            person_count: if calibrated_present {
+                self.stable_occupancy
+            } else {
+                0
+            },
+            presence_authority: presence_authority.to_string(),
+            duty_share: self.occupancy_duty_share,
+            duty_window_ms: self.occupancy_duty_window_ms,
         })
     }
 
@@ -2868,6 +2924,8 @@ impl AppStateInner {
     pub(crate) fn minimal() -> Self {
         AppStateInner {
             occupancy_duty: std::collections::VecDeque::new(),
+            occupancy_duty_share: 0.0,
+            occupancy_duty_window_ms: OCCUPANCY_DUTY_WINDOW_MS,
             residual_quiet_floor: None,
             residual_boundary_effective: None,
             vitals_baseline_sum: HashMap::new(),
@@ -3067,10 +3125,21 @@ mod calibration_expiry_tests {
 
     /// The Mac app's held-out empty check consumes this evidence and refuses to
     /// store a startup baseline without it. Assert the wire schema and every
-    /// identity field the client matches against its receipt.
+    /// identity field the client matches against its receipt, and that the
+    /// verdict riding on it is the one the classification publishes.
     #[test]
     fn calibrated_presence_evidence_binds_the_active_model_receipt() {
-        let state = state_with_receipt();
+        // The evidence publishes the duty-cycle filtered verdict, so acquire
+        // the filter the way the runtime does: a full window of occupied
+        // samples.
+        let mut state = state_with_receipt();
+        let mut now = std::time::Instant::now();
+        for _ in 0..=200 {
+            state.observe_occupancy(1, None, now);
+            now += std::time::Duration::from_millis(200);
+        }
+        assert_eq!(state.stable_occupancy, 1, "the duty filter must acquire");
+
         let evidence = state
             .calibrated_presence_evidence(5, 77, 1_500)
             .expect("a fresh explicit calibration must publish calibrated evidence");
@@ -3088,12 +3157,61 @@ mod calibration_expiry_tests {
         assert_eq!(evidence.inference_node_id, 5);
         assert_eq!(evidence.source_tick, 77);
         assert_eq!(evidence.observed_at_unix_ms, 1_500);
-        assert!(!evidence.inference_method.is_empty());
+        assert!(
+            evidence.inference_method.ends_with("+duty_cycle_union_v1"),
+            "the method must name the chain that produced the verdict: {}",
+            evidence.inference_method
+        );
 
-        // The evidence and the server's own count come from one model and one
-        // history, so they can never disagree.
-        assert_eq!(evidence.person_count, state.person_count_at(1_500));
-        assert_eq!(evidence.presence, evidence.person_count > 0);
+        // One verdict per frame: the evidence carries the union the
+        // classification publishes, and the count is the filtered calibrated
+        // count, so a consumer cannot read two answers from one frame.
+        assert_eq!(evidence.presence_authority, "calibrated_occupancy");
+        assert_eq!(evidence.person_count, state.stable_occupancy);
+        assert_eq!(
+            evidence.presence,
+            state.stable_occupancy > 0 || state.room_debounced_level != "absent"
+        );
+        assert!(evidence.presence);
+
+        // The filter's own basis travels with the verdict so it can be audited.
+        assert_eq!(evidence.duty_window_ms, OCCUPANCY_DUTY_WINDOW_MS);
+        assert!(evidence.duty_share >= OCCUPANCY_DUTY_ACQUIRE_PCT as f64 / 100.0);
+    }
+
+    /// A verdict motion evidence alone asserted keeps the calibration identity
+    /// but claims no count, so it can never be read as a calibrated occupancy.
+    #[test]
+    fn presence_evidence_from_motion_claims_no_calibrated_count() {
+        let mut state = state_with_receipt();
+        state.room_debounced_level = "present_still".to_string();
+
+        let evidence = state
+            .calibrated_presence_evidence(5, 12, 1_500)
+            .expect("the identity is still bound");
+        assert!(evidence.presence);
+        assert_eq!(evidence.presence_authority, "motion_evidence");
+        assert_eq!(evidence.inference_method, "motion_evidence");
+        assert_eq!(
+            evidence.person_count, 0,
+            "motion evidence must not claim a calibrated count"
+        );
+    }
+
+    /// With neither motion nor a filtered calibrated occupancy the verdict is
+    /// absent, and the identity is still published so a consumer can tell
+    /// "calibrated room reading empty" from "no evidence at all".
+    #[test]
+    fn presence_evidence_reports_absence_with_its_identity() {
+        let state = state_with_receipt();
+
+        let evidence = state
+            .calibrated_presence_evidence(5, 12, 1_500)
+            .expect("the identity is still bound");
+        assert!(!evidence.presence);
+        assert_eq!(evidence.presence_authority, "none");
+        assert_eq!(evidence.inference_method, "unavailable");
+        assert_eq!(evidence.person_count, 0);
     }
 
     /// Absence must mean "not calibrated", never "the path is broken", so pair
@@ -13356,6 +13474,8 @@ async fn main() {
         // room empty, summarized when that collection finalizes
         // (see VitalsNullCollector).
         occupancy_duty: std::collections::VecDeque::new(),
+        occupancy_duty_share: 0.0,
+        occupancy_duty_window_ms: OCCUPANCY_DUTY_WINDOW_MS,
         residual_quiet_floor: None,
         residual_boundary_effective: None,
         vitals_baseline_sum: HashMap::new(),

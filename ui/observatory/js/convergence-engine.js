@@ -3,6 +3,7 @@
  * RSSI waveform, person orbs, classification, fall alert, metric bars
  */
 import * as THREE from 'three';
+import { presenceEvidenceOf } from '../../services/presence-evidence.js';
 
 const WAVEFORM_POINTS = 120;
 
@@ -123,7 +124,9 @@ export class ConvergenceEngine {
     const features = data?.features || {};
     const classification = data?.classification || {};
     const persons = data?.persons || [];
-    const estPersons = data?.estimated_persons || 0;
+    // Prefer the server's presence evidence: it carries the authority behind
+    // the verdict and reports "no count claimed" as zero.
+    const estPersons = presenceEvidenceOf(data).persons;
 
     // --- Update RSSI waveform ---
     const rssi = features.mean_rssi || -50;

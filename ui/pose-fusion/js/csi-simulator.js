@@ -11,6 +11,7 @@
 import { reconnectState, scheduleReconnect, cancelReconnect, reconnectSucceeded,
          suppressReconnect, allowReconnect }
   from '../../services/ws-reconnect.js';
+import { presenceEvidenceOf } from '../../services/presence-evidence.js';
 
 export class CsiSimulator {
   static VERSION = 'v4-drift';  // Cache-bust verification
@@ -55,6 +56,10 @@ export class CsiSimulator {
     // duty-cycle filtered calibrated occupancy. Both pages read this one field
     // so they cannot disagree about the same room.
     this.serverPresenceVerdict = null;
+    // Which authority asserted the verdict, and the calibration model it was
+    // bound to, so the page can name them instead of guessing from the count.
+    this.serverPresenceAuthority = null;
+    this.serverPresenceModelId = null;
     // Published vitals from the sensing update (`null` while the ADR-021/ADR-293
     // gate abstains) and the gate's own explanation, fetched from
     // /api/v1/vital-signs so the page can say *why* there are no numbers.
@@ -130,6 +135,10 @@ export class CsiSimulator {
     // duty-cycle filtered calibrated occupancy. Both pages read this one field
     // so they cannot disagree about the same room.
     this.serverPresenceVerdict = null;
+    // Which authority asserted the verdict, and the calibration model it was
+    // bound to, so the page can name them instead of guessing from the count.
+    this.serverPresenceAuthority = null;
+    this.serverPresenceModelId = null;
   }
 
   /** True only once a real frame has been decoded — not merely on socket open. */
@@ -455,13 +464,19 @@ export class CsiSimulator {
     // instead of showing a bare confidence number, and so the CSI-only pose can
     // be suppressed when the room is empty.
     const cls = msg.classification;
+    // The verdict, its count and its authority come from the server's presence
+    // evidence when the frame carries it; a frame without evidence falls back
+    // to the classification, which carries the same verdict.
+    const presence = presenceEvidenceOf(msg);
+    this.serverPersons = presence.persons;
+    this.serverPresenceVerdict = presence.presence;
+    this.serverPresenceAuthority = presence.authority;
+    this.serverPresenceModelId = presence.modelId;
     if (cls) {
       if (typeof cls.confidence === 'number') {
-        this.personPresence = cls.presence ? cls.confidence : 0;
+        this.personPresence = presence.presence ? cls.confidence : 0;
       }
       if (typeof cls.motion_level === 'string') this.serverPresence = cls.motion_level;
-      this.serverPersons = typeof msg.estimated_persons === 'number' ? msg.estimated_persons : 0;
-      this.serverPresenceVerdict = typeof cls.presence === 'boolean' ? cls.presence : null;
       // Keep the last published value: the gate only opens on a minority of frames
       // (~9.5% MEASURED), so clearing on every message would hide numbers the
       // server is publishing. The age is carried alongside so the display can say
