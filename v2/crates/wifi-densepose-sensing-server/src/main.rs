@@ -2860,6 +2860,40 @@ impl AppStateInner {
         }
     }
 
+    /// The occupancy the frame publishes, and the only place the duty-cycle
+    /// filter is advanced.
+    ///
+    /// Every published frame runs the filter, including the frames the
+    /// empty-room reference already calls empty. Running it only on the "not
+    /// empty" branch froze its 30 s window for as long as the room stayed
+    /// empty, so `duty_share` described a decision the filter had not made
+    /// (MEASURED: 1.000 for 2295 frames in an empty room whose reference
+    /// matched in 23 of 23 samples) and the drift guard, which only updates
+    /// while the room reads quiet, could never run in the case it exists for.
+    ///
+    /// The negative-only empty reference outranks the count: a window that
+    /// conforms to the calibration's empty-room reference is empty whatever the
+    /// eigenvalue count reads, which is what stops an empty room from
+    /// publishing vitals because a chair moved. It feeds the filter as zero
+    /// rather than as a separate verdict, so release happens on the same
+    /// evidence the acquire did.
+    fn occupancy_decision_at(
+        &mut self,
+        observed_at_unix_ms: u64,
+        now: std::time::Instant,
+    ) -> Option<usize> {
+        if !self.occupancy_calibration_active_at(observed_at_unix_ms) {
+            return None;
+        }
+        let background = self.runtime_background_match(observed_at_unix_ms);
+        let quiet_residual = background.map(|matched| matched.residual_energy);
+        let raw_count = match background {
+            Some(matched) if matched.matches_empty => 0,
+            _ => self.person_count_at(observed_at_unix_ms),
+        };
+        Some(self.observe_occupancy(raw_count, quiet_residual, now))
+    }
+
     fn person_count_at(&self, observed_at_unix_ms: u64) -> usize {
         // A persisted bootstrap model has negative-only authority. Its only
         // allowed occupancy effect is the explicit empty-background suppression
@@ -3264,6 +3298,45 @@ mod calibration_expiry_tests {
         // The filter's own basis travels with the verdict so it can be audited.
         assert_eq!(evidence.duty_window_ms, OCCUPANCY_DUTY_WINDOW_MS);
         assert!(evidence.duty_share >= OCCUPANCY_DUTY_ACQUIRE_PCT as f64 / 100.0);
+    }
+
+    /// The filter must advance on empty frames too, or its share freezes at
+    /// whatever the last non-empty stretch left behind (MEASURED on the rig:
+    /// `duty_share` 1.000 for 2295 empty-room frames).
+    #[test]
+    fn an_empty_room_advances_the_duty_filter_instead_of_freezing_it() {
+        let mut state = state_with_model(false);
+        let now = std::time::Instant::now();
+        // The stale value the frozen window used to keep publishing.
+        state.occupancy_duty_share = 1.0;
+        state.stable_occupancy = 1;
+
+        let mut clock = now;
+        for _ in 0..200 {
+            let decision = state.occupancy_decision_at(1_500, clock);
+            assert_eq!(decision, Some(0), "the reference matches empty");
+            clock += std::time::Duration::from_millis(200);
+        }
+
+        assert_eq!(
+            state.occupancy_duty_share, 0.0,
+            "the share must describe the frames being published, not a stale window"
+        );
+        assert_eq!(state.stable_occupancy, 0, "an empty room must release");
+        assert_eq!(
+            state.occupancy_duty_window_ms, OCCUPANCY_DUTY_WINDOW_MS,
+            "the window the share was measured over must travel with it"
+        );
+    }
+
+    /// Without a calibration the decision abstains instead of inventing one.
+    #[test]
+    fn the_occupancy_decision_abstains_without_a_calibration() {
+        let mut state = AppStateInner::minimal();
+        assert_eq!(
+            state.occupancy_decision_at(1_500, std::time::Instant::now()),
+            None
+        );
     }
 
     /// A verdict motion evidence alone asserted keeps the calibration identity
@@ -11978,33 +12051,11 @@ async fn udp_receiver_task(
                     // else heuristic"). MEASURED with a person sitting still:
                     // motion_level `absent` while `person_count_at` read 1, so the
                     // published count was `None` and every UI showed an empty room.
-                    let calibrated_occupancy = if s
-                        .explicit_calibration_fresh_at(observed_at_unix_ms)
-                    {
-                        match s.runtime_background_match(observed_at_unix_ms) {
-                            // Negative-only authority, exactly as the bootstrap prior
-                            // is used: a window that conforms to the calibration's
-                            // empty-room reference is empty, whatever the eigenvalue
-                            // count reads. This is what stops an empty room from
-                            // publishing vitals because a chair moved.
-                            Some(matched) if matched.matches_empty => Some(0),
-                            _ => {
-                                // Read the frame's residual before borrowing the state mutably.
-                    let quiet_residual = s
-                        .runtime_background_match(observed_at_unix_ms)
-                        .map(|matched| matched.residual_energy);
-                    let raw_count = s.person_count_at(observed_at_unix_ms);
-                                let occupancy_now = std::time::Instant::now();
-                                Some(s.observe_occupancy(
-                                    raw_count,
-                                    quiet_residual,
-                                    occupancy_now,
-                                ))
-                            }
-                        }
-                    } else {
-                        None
-                    };
+                    // One occupancy decision, on every frame that publishes a
+                    // verdict, so the duty-cycle filter, the quiet floor and the
+                    // published share all describe the frame being published.
+                    let calibrated_occupancy =
+                        s.occupancy_decision_at(observed_at_unix_ms, std::time::Instant::now());
 
                     let total_persons = if bootstrap_empty {
                         0
