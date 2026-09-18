@@ -3157,6 +3157,97 @@ impl AppStateInner {
 }
 
 #[cfg(test)]
+mod publication_ceiling_tests {
+    use super::*;
+
+    fn floor(breathing_p95: f64, heartbeat_p95: f64) -> VitalsNullFloor {
+        VitalsNullFloor {
+            breathing_p50: breathing_p95 / 2.0,
+            breathing_p95,
+            breathing_phase_p50: 1.0,
+            breathing_phase_p95: breathing_p95,
+            heartbeat_p50: heartbeat_p95 / 2.0,
+            heartbeat_p95,
+            samples: 5_000,
+        }
+    }
+
+    fn candidates(breathing: f64, heartbeat: f64) -> VitalSigns {
+        VitalSigns {
+            breathing_rate_bpm: Some(breathing),
+            heart_rate_bpm: Some(heartbeat),
+            breathing_confidence: 0.9,
+            heartbeat_confidence: 0.9,
+            signal_quality: 0.9,
+        }
+    }
+
+    /// MEASURED failure this prevents: the rig published 11.7 bpm while every
+    /// node's ratio sat between 0.56 and 1.24 against ceilings of 2.35 to 3.17.
+    #[test]
+    fn a_number_inside_the_empty_room_noise_is_not_published() {
+        let published = vitals_for_publication_with_ceiling(
+            &candidates(11.7, 88.0),
+            true,
+            1,
+            Some(&floor(2.65, 2.80)),
+            1.24, 1.04,
+        );
+        assert!(
+            published.is_none(),
+            "both metrics are inside the room's own noise: {published:?}"
+        );
+    }
+
+    /// The same numbers are publishable once they clear the ceiling, so the
+    /// gate separates noise from signal rather than blocking everything.
+    #[test]
+    fn a_number_above_the_ceiling_is_published() {
+        let published = vitals_for_publication_with_ceiling(
+            &candidates(14.0, 62.0),
+            true,
+            1,
+            Some(&floor(2.65, 2.80)),
+            5.0, 4.4,
+        )
+        .expect("clearing the ceiling must publish");
+        assert_eq!(published.breathing_rate_bpm, Some(14.0));
+        assert_eq!(published.heart_rate_bpm, Some(62.0));
+    }
+
+    /// Metrics are judged separately: a noisy heart band must not hide a
+    /// breathing number that does clear its ceiling.
+    #[test]
+    fn the_gate_is_per_metric() {
+        let published = vitals_for_publication_with_ceiling(
+            &candidates(14.0, 88.0),
+            true,
+            1,
+            Some(&floor(2.65, 2.80)),
+            5.0, 1.0,
+        )
+        .expect("breathing clears its ceiling");
+        assert_eq!(published.breathing_rate_bpm, Some(14.0));
+        assert_eq!(published.heart_rate_bpm, None);
+        assert_eq!(published.heartbeat_confidence, 0.0);
+    }
+
+    /// Without a measured ceiling nothing can be shown to clear it.
+    #[test]
+    fn a_missing_ceiling_fails_closed() {
+        assert!(vitals_for_publication_with_ceiling(
+            &candidates(14.0, 62.0),
+            true,
+            1,
+            None,
+            9.0, 9.0,
+        )
+        .is_none());
+        assert!(!clears_empty_room_ceiling(9.0, Some(0.0)));
+        assert!(!clears_empty_room_ceiling(f64::NAN, Some(2.65)));
+    }
+}
+
 mod calibration_expiry_tests {
     use super::*;
     use wifi_densepose_signal::ruvsense::field_model::FieldModelConfig;
@@ -8303,6 +8394,71 @@ fn vitals_for_publication(
     })
 }
 
+/// Margin an estimate must clear over the reporting node's own empty-room
+/// ceiling before it is published.
+///
+/// The ceiling is a 95th percentile of that node's band ratio during the
+/// verified empty hold, so a value at or below it is indistinguishable from the
+/// room's own noise. 1.5 is the smallest margin that still separates the two on
+/// this rig's recorded ratios; it is a policy choice, not a measurement.
+const VITAL_PUBLICATION_MIN_NULL_MARGIN: f64 = 1.5;
+
+/// Does an observed band ratio clear the reporting node's measured ceiling?
+///
+/// Fail closed: without a measured ceiling there is nothing to clear, so the
+/// estimate is not published. A calibration that produced no null floor for
+/// this node cannot vouch for its numbers.
+fn clears_empty_room_ceiling(observed_ratio: f64, ceiling: Option<f64>) -> bool {
+    match ceiling {
+        Some(ceiling) if ceiling > f64::EPSILON && observed_ratio.is_finite() => {
+            observed_ratio >= ceiling * VITAL_PUBLICATION_MIN_NULL_MARGIN
+        }
+        _ => false,
+    }
+}
+
+/// Publish only the metrics that clear the reporting node's own empty-room
+/// ceiling.
+///
+/// The live publish path calls this instead of `vitals_for_publication`, so a
+/// confidence that is high on a noisy link cannot put a number on the wire:
+/// MEASURED, the rig published 11.7 bpm and 60.5 to 94.7 bpm while the same
+/// nodes' ratios stayed below their own empty-room ceilings.
+fn vitals_for_publication_with_ceiling(
+    candidates: &VitalSigns,
+    explicit_calibration_fresh: bool,
+    person_count: usize,
+    ceiling: Option<&VitalsNullFloor>,
+    breathing_peak_ratio: f64,
+    heartbeat_peak_ratio: f64,
+) -> Option<VitalSigns> {
+    let mut published = vitals_for_publication(candidates, explicit_calibration_fresh, person_count)?;
+
+    if published.breathing_rate_bpm.is_some()
+        && !clears_empty_room_ceiling(
+            breathing_peak_ratio,
+            ceiling.map(|floor| floor.breathing_p95),
+        )
+    {
+        published.breathing_rate_bpm = None;
+        published.breathing_confidence = 0.0;
+    }
+    if published.heart_rate_bpm.is_some()
+        && !clears_empty_room_ceiling(
+            heartbeat_peak_ratio,
+            ceiling.map(|floor| floor.heartbeat_p95),
+        )
+    {
+        published.heart_rate_bpm = None;
+        published.heartbeat_confidence = 0.0;
+    }
+
+    if published.breathing_rate_bpm.is_none() && published.heart_rate_bpm.is_none() {
+        return None;
+    }
+    Some(published)
+}
+
 fn edge_vitals_message_for_publication(
     raw: &Esp32VitalsPacket,
     published_vitals: Option<&VitalSigns>,
@@ -12174,10 +12330,22 @@ async fn udp_receiver_task(
                     };
                     let explicit_calibration_fresh =
                         s.explicit_calibration_fresh_at(observed_at_unix_ms);
-                    let published_vitals = vitals_for_publication(
+                    // The ceiling is the reporting node's own empty-room
+                    // noise, so a number on a noisy link is not published on
+                    // confidence alone (improvement plan items 2 and 3).
+                    let published_vitals = vitals_for_publication_with_ceiling(
                         &vitals,
                         explicit_calibration_fresh,
                         total_persons,
+                        s.vitals_null_floors.get(&node_id),
+                        s.node_states
+                            .get(&node_id)
+                            .map(|node| node.vital_detector.last_evidence().breathing_peak_ratio)
+                            .unwrap_or(0.0),
+                        s.node_states
+                            .get(&node_id)
+                            .map(|node| node.vital_detector.last_evidence().heartbeat_peak_ratio)
+                            .unwrap_or(0.0),
                     );
 
                     let calibrated_presence_evidence = s.calibrated_presence_evidence(
