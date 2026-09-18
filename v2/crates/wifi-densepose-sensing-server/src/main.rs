@@ -3229,7 +3229,7 @@ mod publication_ceiling_tests {
             true,
             1,
             Some(&floor(2.65, 2.80)),
-            1.24, 1.04,
+            1.24, 1.24, 1.04,
         );
         assert!(
             published.is_none(),
@@ -3246,7 +3246,7 @@ mod publication_ceiling_tests {
             true,
             1,
             Some(&floor(2.65, 2.80)),
-            5.0, 4.4,
+            5.0, 5.0, 4.4,
         )
         .expect("clearing the ceiling must publish");
         assert_eq!(published.breathing_rate_bpm, Some(14.0));
@@ -3262,12 +3262,30 @@ mod publication_ceiling_tests {
             true,
             1,
             Some(&floor(2.65, 2.80)),
-            5.0, 1.0,
+            5.0, 5.0, 1.0,
         )
         .expect("breathing clears its ceiling");
         assert_eq!(published.breathing_rate_bpm, Some(14.0));
         assert_eq!(published.heart_rate_bpm, None);
         assert_eq!(published.heartbeat_confidence, 0.0);
+    }
+
+    /// A node whose phase difference tracks breathing must not be suppressed
+    /// by an amplitude feature that sits in its own noise.
+    #[test]
+    fn a_phase_feature_can_carry_the_breathing_number() {
+        let published = vitals_for_publication_with_ceiling(
+            &candidates(13.5, 88.0),
+            true,
+            1,
+            Some(&floor(2.65, 2.80)),
+            1.10,  // amplitude: inside the room's own noise
+            4.20,  // phase: clears its own ceiling of 2.65
+            1.00,  // heartbeat: inside its ceiling
+        )
+        .expect("the phase feature clears its ceiling");
+        assert_eq!(published.breathing_rate_bpm, Some(13.5));
+        assert_eq!(published.heart_rate_bpm, None);
     }
 
     /// Without a measured ceiling nothing can be shown to clear it.
@@ -3278,7 +3296,7 @@ mod publication_ceiling_tests {
             true,
             1,
             None,
-            9.0, 9.0,
+            9.0, 9.0, 9.0,
         )
         .is_none());
         assert!(!clears_empty_room_ceiling(9.0, Some(0.0)));
@@ -8470,16 +8488,25 @@ fn vitals_for_publication_with_ceiling(
     person_count: usize,
     ceiling: Option<&VitalsNullFloor>,
     breathing_peak_ratio: f64,
+    breathing_phase_peak_ratio: f64,
     heartbeat_peak_ratio: f64,
 ) -> Option<VitalSigns> {
     let mut published = vitals_for_publication(candidates, explicit_calibration_fresh, person_count)?;
 
-    if published.breathing_rate_bpm.is_some()
-        && !clears_empty_room_ceiling(
-            breathing_peak_ratio,
-            ceiling.map(|floor| floor.breathing_p95),
-        )
-    {
+    // The node's own ceilings are separate per feature, and breathing shows up
+    // in the amplitude of some links and in the phase difference of others.
+    // MEASURED on the rig, the amplitude ratio sat at 0.52 to 1.21 against a
+    // 1.50 gate while the phase ratio was no better, so neither feature is
+    // trusted on its own: whichever clears its own ceiling carries the number.
+    let amplitude_clears = clears_empty_room_ceiling(
+        breathing_peak_ratio,
+        ceiling.map(|floor| floor.breathing_p95),
+    );
+    let phase_clears = clears_empty_room_ceiling(
+        breathing_phase_peak_ratio,
+        ceiling.map(|floor| floor.breathing_phase_p95),
+    );
+    if published.breathing_rate_bpm.is_some() && !(amplitude_clears || phase_clears) {
         published.breathing_rate_bpm = None;
         published.breathing_confidence = 0.0;
     }
@@ -10685,10 +10712,32 @@ async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_js
     let person_count = s.person_count_at(observed_at_unix_ms);
     let explicit_calibration_fresh =
         s.explicit_calibration_fresh_at(observed_at_unix_ms);
-    let published = vitals_for_publication(
+    // Attribute the route to the node the field model scores, so it passes the
+    // same empty-room ceiling gate as the live stream. Before this it reported
+    // the ungated global mirror, which is how the dashboard could show a number
+    // that the stream was withholding (MEASURED: breathing 8.78 and 10.45 on
+    // the route while no frame carried `vital_signs`).
+    let reporter_node = s.calibration_grid_binding.map(|binding| binding.source_node_id);
+    let reporting_ceiling = reporter_node.and_then(|node_id| s.vitals_null_floors.get(&node_id));
+    let (breathing_ratio, breathing_phase_ratio, heartbeat_ratio) = reporter_node
+        .and_then(|node_id| s.node_states.get(&node_id))
+        .map(|node| {
+            let evidence = node.vital_detector.last_evidence();
+            (
+                evidence.breathing_peak_ratio,
+                evidence.breathing_phase_peak_ratio,
+                evidence.heartbeat_peak_ratio,
+            )
+        })
+        .unwrap_or((0.0, 0.0, 0.0));
+    let published = vitals_for_publication_with_ceiling(
         &s.latest_vitals,
         explicit_calibration_fresh,
         person_count,
+        reporting_ceiling,
+        breathing_ratio,
+        breathing_phase_ratio,
+        heartbeat_ratio,
     );
     // The live ESP32 path feeds the *per-node* detectors (`NodeState::vital_detector`)
     // and mirrors only the smoothed result into `s.latest_vitals`; the global
@@ -12385,6 +12434,12 @@ async fn udp_receiver_task(
                         s.node_states
                             .get(&node_id)
                             .map(|node| node.vital_detector.last_evidence().breathing_peak_ratio)
+                            .unwrap_or(0.0),
+                        s.node_states
+                            .get(&node_id)
+                            .map(|node| {
+                                node.vital_detector.last_evidence().breathing_phase_peak_ratio
+                            })
                             .unwrap_or(0.0),
                         s.node_states
                             .get(&node_id)
