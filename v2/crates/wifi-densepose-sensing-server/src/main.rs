@@ -45,6 +45,11 @@ use wifi_densepose_sensing_server::bootstrap_baseline::{
     BOOTSTRAP_VALIDATION_MIN_SPACING_MS, BOOTSTRAP_VALIDATION_SAMPLES,
     BOOTSTRAP_VALIDATION_SAMPLE_TIMEOUT_MS,
 };
+// ADR-364: a completed calibration is persisted so a restart does not burn the
+// empty hold. A restored image carries occupancy authority only.
+use wifi_densepose_sensing_server::calibration_persistence::{
+    self, ExplicitCalibrationIdentity, ExplicitCalibrationMetadata,
+};
 // ADR-295 / ADR-297: canonical provenance state + per-node/room inference.
 use wifi_densepose_sensing_server::inference::{fuse_room, NodeInference, RoomInference};
 use wifi_densepose_sensing_server::provenance::SourceState;
@@ -437,6 +442,11 @@ struct CalibratedPresenceEvidence {
     person_count: usize,
     /// `calibrated_occupancy`, `motion_evidence`, or `none`.
     presence_authority: String,
+    /// True when the verdict was computed against a calibration restored from
+    /// disk rather than a hold completed in this process (ADR-364). Such a
+    /// verdict carries occupancy authority only: numeric vitals stay
+    /// abstained.
+    restored: bool,
     /// Share of the verdict window that read as occupied, and the window
     /// length: the basis of a duty-cycle verdict, published so the filter can
     /// be audited instead of trusted.
@@ -2133,6 +2143,11 @@ struct AppStateInner {
     bootstrap_baseline: Option<BootstrapBaselineMetadata>,
     /// A restored prior can affect startup occupancy but cannot authorize vitals.
     bootstrap_baseline_active: bool,
+    /// A completed calibration restored from disk (ADR-364). It carries
+    /// occupancy authority with the identity of the hold that produced it, and
+    /// it never authorizes numeric vitals.
+    restored_calibration: Option<ExplicitCalibrationMetadata>,
+    restored_calibration_active: bool,
     /// Server generated identity for the current explicit calibration model.
     calibration_model_id: Option<String>,
     /// Process and current explicit room-calibration identities.
@@ -2524,7 +2539,23 @@ impl AppStateInner {
 
     fn explicit_calibration_fresh_at(&self, observed_at_unix_ms: u64) -> bool {
         !self.bootstrap_baseline_active
+            && !self.restored_calibration_active
             && self.field_model_status_at(observed_at_unix_ms) == Some(CalibrationStatus::Fresh)
+    }
+
+    /// Occupancy authority: a hold completed in this process, or a completed
+    /// calibration restored from disk (ADR-364).
+    ///
+    /// Numeric vitals stay gated on [`Self::explicit_calibration_fresh_at`], so
+    /// a restored calibration can never publish heart or breathing rates. It
+    /// exists so a restart - a deploy, a crash, a power cycle - does not cost
+    /// the operator another empty hold, which is the one thing this fork's
+    /// presence detection cannot work without.
+    fn occupancy_calibration_active_at(&self, observed_at_unix_ms: u64) -> bool {
+        self.explicit_calibration_fresh_at(observed_at_unix_ms)
+            || (self.restored_calibration_active
+                && self.field_model_status_at(observed_at_unix_ms)
+                    == Some(CalibrationStatus::Fresh))
     }
 
     /// Return the effective data source, accounting for ESP32 frame timeout.
@@ -2710,7 +2741,8 @@ impl AppStateInner {
 
     /// Per-frame presence evidence bound to the active model receipt.
     ///
-    /// Returns `None` unless an explicit calibration is fresh and carries a
+    /// Returns `None` unless an occupancy calibration is active - a fresh hold
+    /// completed in this process, or one restored from disk - and carries a
     /// complete receipt, because evidence without identity cannot be audited.
     /// The verdict itself is this fork's published one — motion evidence
     /// unioned with the duty-cycle filtered calibrated occupancy — so the
@@ -2726,7 +2758,7 @@ impl AppStateInner {
         source_tick: u64,
         observed_at_unix_ms: u64,
     ) -> Option<CalibratedPresenceEvidence> {
-        if !self.explicit_calibration_fresh_at(observed_at_unix_ms) {
+        if !self.occupancy_calibration_active_at(observed_at_unix_ms) {
             return None;
         }
         let receipt = self.calibration_model_receipt.as_ref()?;
@@ -2770,9 +2802,62 @@ impl AppStateInner {
                 0
             },
             presence_authority: presence_authority.to_string(),
+            restored: self.restored_calibration_active,
             duty_share: self.occupancy_duty_share,
             duty_window_ms: self.occupancy_duty_window_ms,
         })
+    }
+
+    /// Persist the completed calibration so a restart does not burn the empty
+    /// hold (ADR-364).
+    ///
+    /// A failure is logged, never fatal: the calibration is valid in this
+    /// process either way, and a missing image only costs a hold later.
+    fn persist_explicit_calibration(&self) {
+        let Some(installation_id) = self.installation_id.as_deref() else {
+            debug!("No installation id; the completed calibration is not persisted");
+            return;
+        };
+        let Some(receipt) = self.calibration_model_receipt.as_ref() else {
+            return;
+        };
+        let Some(binding) = self.calibration_grid_binding else {
+            return;
+        };
+        let Some(field_model) = self.field_model.as_ref() else {
+            return;
+        };
+        let identity = ExplicitCalibrationIdentity {
+            boot_epoch: receipt.boot_epoch.clone(),
+            session_id: receipt.session_id.clone(),
+            model_id: receipt.model_id.clone(),
+            binding_digest: receipt.binding_digest.clone(),
+            source_node_ids: receipt.source_node_ids.clone(),
+            source_grid: bootstrap_baseline::BootstrapCsiGrid {
+                n_subcarriers: binding.grid.n_subcarriers,
+                ppdu_type: binding.grid.ppdu_type,
+            },
+            frame_count: receipt.frame_count,
+            variance_explained: receipt.variance_explained,
+            baseline_eigenvalue_count: receipt.baseline_eigenvalue_count,
+            model_completed_at_unix_ms: receipt.completed_at_unix_ms,
+        };
+        let path = calibration_persistence::path_in(&self.data_dir);
+        let created_at_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        match calibration_persistence::store(
+            &path,
+            installation_id,
+            &identity,
+            field_model,
+            created_at_unix_ms,
+        ) {
+            Ok(metadata) => info!(
+                model_id = %metadata.identity.model_id,
+                expires_at_unix_ms = metadata.expires_at_unix_ms,
+                "Persisted the completed calibration for restart recovery"
+            ),
+            Err(error) => warn!(%error, "Could not persist the completed calibration"),
+        }
     }
 
     fn person_count_at(&self, observed_at_unix_ms: u64) -> usize {
@@ -3009,6 +3094,8 @@ impl AppStateInner {
             installation_id: None,
             bootstrap_baseline: None,
             bootstrap_baseline_active: false,
+            restored_calibration: None,
+            restored_calibration_active: false,
             calibration_model_id: None,
             calibration_boot_epoch: opaque_calibration_id("cal-boot"),
             calibration_session_id: None,
@@ -3231,6 +3318,126 @@ mod calibration_expiry_tests {
         // An expired model scores nothing.
         let expired = state_with_receipt();
         assert!(expired.calibrated_presence_evidence(5, 77, u64::MAX / 2).is_none());
+    }
+
+    fn restored_metadata() -> ExplicitCalibrationMetadata {
+        ExplicitCalibrationMetadata {
+            authority: calibration_persistence::EXPLICIT_CALIBRATION_AUTHORITY,
+            identity: ExplicitCalibrationIdentity {
+                boot_epoch: "cal-boot-restored".to_string(),
+                session_id: "cal-session-restored".to_string(),
+                model_id: "cal-model-restored".to_string(),
+                binding_digest: "cd".repeat(32),
+                source_node_ids: vec![5],
+                source_grid: bootstrap_baseline::BootstrapCsiGrid {
+                    n_subcarriers: 64,
+                    ppdu_type: 0,
+                },
+                frame_count: 1_000,
+                variance_explained: 0.9,
+                baseline_eigenvalue_count: 1,
+                model_completed_at_unix_ms: 1_000,
+            },
+            created_at_unix_ms: 2_000,
+            expires_at_unix_ms: 3_000,
+            content_sha256: "ef".repeat(32),
+        }
+    }
+
+    /// ADR-364: a restart must not cost another empty hold, so a restored
+    /// calibration keeps publishing occupancy evidence - with the identity of
+    /// the hold that produced it - while numeric vitals stay abstained.
+    #[test]
+    fn a_restored_calibration_publishes_occupancy_evidence_and_not_vitals() {
+        let mut state = state_with_receipt();
+        state.restored_calibration_active = true;
+        state.restored_calibration = Some(restored_metadata());
+
+        let mut now = std::time::Instant::now();
+        for _ in 0..=200 {
+            state.observe_occupancy(1, None, now);
+            now += std::time::Duration::from_millis(200);
+        }
+        assert_eq!(state.stable_occupancy, 1, "the duty filter must acquire");
+
+        assert!(
+            state.occupancy_calibration_active_at(1_500),
+            "a restored calibration carries occupancy authority"
+        );
+        assert!(
+            !state.explicit_calibration_fresh_at(1_500),
+            "numeric vitals must stay gated on a hold completed in this process"
+        );
+
+        let evidence = state
+            .calibrated_presence_evidence(5, 9, 1_500)
+            .expect("a restored calibration publishes evidence");
+        assert!(evidence.restored, "the verdict must say it was restored");
+        assert!(evidence.presence);
+        assert_eq!(evidence.person_count, 1);
+        assert_eq!(evidence.presence_authority, "calibrated_occupancy");
+        // The identity is the one the original hold published, so a consumer
+        // that matched a receipt before the restart can match it after.
+        assert_eq!(evidence.session_id, "cal-session-test");
+        assert_eq!(evidence.model_id, "cal-model-test");
+        assert_eq!(evidence.binding_digest, "ab".repeat(32));
+    }
+
+    /// A bootstrapped prior stays negative-only even when a restored
+    /// calibration exists: the two authorities must not be conflated.
+    #[test]
+    fn a_restored_calibration_does_not_activate_the_bootstrap_prior() {
+        let mut state = state_with_model(true);
+        state.restored_calibration_active = true;
+        state.restored_calibration = Some(restored_metadata());
+
+        assert!(state.bootstrap_baseline_active);
+        assert!(state.occupancy_calibration_active_at(1_500));
+        assert!(!state.explicit_calibration_fresh_at(1_500));
+    }
+
+    /// Status must name the restored authority and its boundary, so an operator
+    /// cannot mistake it for a hold taken in the running process.
+    #[tokio::test]
+    async fn status_reports_the_restored_calibration_and_its_boundary() {
+        // Status is read at the wall clock, so the restored model must still be
+        // fresh when it is read: a restored image inherits the expiry of the
+        // calibration that produced it.
+        let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let mut state = state_with_receipt();
+        let model = finalized_model(now_unix_ms);
+        let baseline = model.modes().expect("modes").baseline[0].clone();
+        state.frame_history = (0..50).map(|_| baseline.clone()).collect();
+        if let Some(node) = state.node_states.get_mut(&5) {
+            node.field_model_history = (0..50).map(|_| baseline.clone()).collect();
+        }
+        state.field_model = Some(model);
+        // The restore path binds no live session: the receipt carries the
+        // identity, and `calibration_session_id` stays empty so a restored
+        // calibration can never be mistaken for one in progress.
+        state.calibration_session_id = None;
+        state.restored_calibration_active = true;
+        state.restored_calibration = Some(restored_metadata());
+        let state = std::sync::Arc::new(tokio::sync::RwLock::new(state));
+
+        let Json(status) = calibration_status(State(state)).await;
+        assert_eq!(status["binding_mode"], "restored_calibration");
+        assert_eq!(status["active"], true);
+        assert_eq!(status["restored_calibration"]["stored"], true);
+        assert_eq!(status["restored_calibration"]["active"], true);
+        assert_eq!(status["restored_calibration"]["occupancy_authorized"], true);
+        assert_eq!(
+            status["restored_calibration"]["numeric_vitals_authorized"],
+            false
+        );
+        assert_eq!(
+            status["restored_calibration"]["authority"],
+            calibration_persistence::EXPLICIT_CALIBRATION_AUTHORITY
+        );
+        assert_eq!(
+            status["restored_calibration"]["content_sha256"],
+            "ef".repeat(32)
+        );
     }
 
     #[test]
@@ -9276,6 +9483,9 @@ async fn calibration_stop(
                     completed_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
                 };
                 s.calibration_model_receipt = Some(receipt.clone());
+                // ADR-364: a restart should not cost the operator another empty
+                // hold. The image carries occupancy authority only.
+                s.persist_explicit_calibration();
                 s.begin_field_model_holdout(binding);
                 info!("Field model calibrated: baseline_eigenvalues={baseline}, variance_explained={variance_explained:.2}");
                 Json(serde_json::json!({
@@ -9311,7 +9521,11 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
     let effective_status = s.field_model_status_at(observed_at_unix_ms);
     let bootstrap_active = s.bootstrap_baseline_active_at(observed_at_unix_ms);
     let bound = s.calibration_session_id.is_some();
-    let active = bootstrap_active || bound;
+    // A restored calibration is active for occupancy, so status must report it
+    // as active evidence rather than as an absent room (ADR-364).
+    let restored_active = s.restored_calibration_active
+        && s.field_model_status_at(observed_at_unix_ms) == Some(CalibrationStatus::Fresh);
+    let active = bootstrap_active || bound || restored_active;
     let bootstrap_background_match = s.bootstrap_background_match(observed_at_unix_ms);
     let runtime_reference = s.field_model.as_ref().and_then(|model| {
         let modes = model.modes()?;
@@ -9381,7 +9595,10 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
             .and_then(|node| node.field_model_latest_seen)
             .map(|seen| now.saturating_duration_since(seen).as_secs_f64())
     });
-    let stalled = active && stall_seconds.is_some_and(|age| age > CALIBRATION_STALL_SECS);
+    // Only a collection can stall: a restored calibration that is not
+    // collecting has nothing to finish, so its stale frames are not a stall.
+    let stalled =
+        bound && active && stall_seconds.is_some_and(|age| age > CALIBRATION_STALL_SECS);
     // Kept out of the `json!` body below, which is already at the macro's
     // recursion limit.
     let stall_hint: Option<&str> = stalled.then_some(
@@ -9415,6 +9632,43 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
             { "active" } else { "stale" },
         })
     });
+    // The restored calibration is reported with its full receipt identity and
+    // its boundary: occupancy evidence yes, numeric vitals no (ADR-364).
+    let restored_calibration_json =
+        s.restored_calibration
+            .as_ref()
+            .map(|metadata| {
+                serde_json::json!({
+                    "stored": true,
+                    "active": restored_active,
+                    "authority": metadata.authority,
+                    "boot_epoch": metadata.identity.boot_epoch,
+                    "session_id": metadata.identity.session_id,
+                    "model_id": metadata.identity.model_id,
+                    "binding_digest": metadata.identity.binding_digest,
+                    "source_node_ids": metadata.identity.source_node_ids,
+                    "source_grid": metadata.identity.source_grid,
+                    "frame_count": metadata.identity.frame_count,
+                    "variance_explained": metadata.identity.variance_explained,
+                    "baseline_eigenvalue_count": metadata.identity.baseline_eigenvalue_count,
+                    "model_completed_at_unix_ms": metadata.identity.model_completed_at_unix_ms,
+                    "created_at_unix_ms": metadata.created_at_unix_ms,
+                    "expires_at_unix_ms": metadata.expires_at_unix_ms,
+                    "content_sha256": metadata.content_sha256,
+                    "occupancy_authorized": restored_active,
+                    "numeric_vitals_authorized": false,
+                })
+            })
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "stored": false,
+                    "active": false,
+                    "authority": "none",
+                    "occupancy_authorized": false,
+                    "numeric_vitals_authorized": false,
+                })
+            });
+
     // Extracted from the response below: the default macro recursion limit is
     // reached by this response's nesting, so the deepest branch lives here.
     let bootstrap_baseline_json = s
@@ -9482,7 +9736,8 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
         "sequence_fault_node_ids": s.calibration_sequence_fault_node_ids,
         "runtime_reference": runtime_reference,
         "vitals_null_floor": vitals_null_floors,
-        "binding_mode": if bootstrap_active { "bootstrap_only" } else if bound { "bound" } else { "none" },
+        "binding_mode": if bootstrap_active { "bootstrap_only" } else if bound { "bound" } else if restored_active { "restored_calibration" } else { "none" },
+        "restored_calibration": restored_calibration_json,
         "bootstrap_baseline": bootstrap_baseline_json,
     });
     response["boot_epoch"] = serde_json::json!(s.calibration_boot_epoch);
@@ -10086,6 +10341,18 @@ async fn calibration_reset(
     }
     s.field_model = None;
     s.calibration_model_id = None;
+    // A reset removes the persisted calibration too, or the next restart would
+    // resurrect exactly what the operator just cleared (ADR-364).
+    let restored_path = calibration_persistence::path_in(&s.data_dir);
+    let restored_removed = match calibration_persistence::remove(&restored_path) {
+        Ok(removed) => removed,
+        Err(error) => {
+            warn!(%error, "Could not remove the persisted calibration during reset");
+            false
+        }
+    };
+    s.restored_calibration = None;
+    s.restored_calibration_active = false;
     s.vitals_null.clear();
     s.vitals_null_floors.clear();
     s.vitals_baseline_sum.clear();
@@ -10115,6 +10382,7 @@ async fn calibration_reset(
         "message": "Calibration model reset.",
         "status": "none",
         "bootstrap_removed": bootstrap_removed,
+        "restored_calibration_removed": restored_removed,
     }))
 }
 
@@ -13337,8 +13605,43 @@ async fn main() {
     // before any request can arrive. Zero-config for a single appliance; the
     // env var still wins for a multi-instance deployment that must share one.
     wifi_densepose_sensing_server::browser_session::init_secret(&data_dir);
+    // ADR-364: a completed calibration persisted by the previous process is
+    // restored first. It carries occupancy authority with the identity of the
+    // hold that produced it, and it is preferred over the negative-only
+    // bootstrap prior because it is the operator's own measurement of this
+    // room.
+    let restored_calibration = if args.calibrate {
+        None
+    } else {
+        args.installation_id.as_deref().and_then(|installation_id| {
+            let path = calibration_persistence::path_in(&data_dir);
+            match calibration_persistence::load(
+                &path,
+                installation_id,
+                chrono::Utc::now().timestamp_millis() as u64,
+            ) {
+                Ok((model, metadata)) => {
+                    info!(
+                        model_id = %metadata.identity.model_id,
+                        expires_at_unix_ms = metadata.expires_at_unix_ms,
+                        "Restored the completed room calibration; numeric vitals stay gated on a hold in this process"
+                    );
+                    Some((model, metadata))
+                }
+                Err(calibration_persistence::ExplicitCalibrationError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    None
+                }
+                Err(error) => {
+                    warn!(%error, "Ignored invalid persisted calibration");
+                    None
+                }
+            }
+        })
+    };
     let (bootstrap_field_model, bootstrap_metadata, bootstrap_baseline_active) =
-        if !args.calibrate {
+        if !args.calibrate && restored_calibration.is_none() {
             args.installation_id.as_deref().map_or(
                 (None, None, false),
                 |installation_id| {
@@ -13371,6 +13674,12 @@ async fn main() {
         } else {
             (None, None, false)
         };
+    // The model is moved into the state below (it is not `Clone`); the metadata
+    // is kept beside it because status and the receipt both report it.
+    let (restored_field_model, restored_metadata) = match restored_calibration {
+        Some((model, metadata)) => (Some(model), Some(metadata)),
+        None => (None, None),
+    };
     info!(
         "Loaded runtime config: dedup_factor={:.2}",
         runtime_config.dedup_factor
@@ -13627,10 +13936,12 @@ async fn main() {
             "Default Room",
             engine_bridge_multistatic_cfg,
         ),
-        field_model: bootstrap_field_model,
+        field_model: bootstrap_field_model.or(restored_field_model),
         installation_id: args.installation_id.clone(),
         bootstrap_baseline: bootstrap_metadata.clone(),
         bootstrap_baseline_active,
+        restored_calibration: restored_metadata.clone(),
+        restored_calibration_active: restored_metadata.is_some(),
         calibration_model_id: None,
         calibration_boot_epoch: opaque_calibration_id("cal-boot"),
         calibration_session_id: None,
@@ -13638,19 +13949,54 @@ async fn main() {
         calibration_source_node_ids: bootstrap_metadata
             .as_ref()
             .map(|metadata| metadata.source_node_ids.iter().copied().collect())
+            .or_else(|| {
+                restored_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.identity.source_node_ids.iter().copied().collect())
+            })
             .unwrap_or_default(),
         calibration_observed_source_node_ids: std::collections::BTreeSet::new(),
-        calibration_model_receipt: None,
-        calibration_grid_binding: bootstrap_metadata.as_ref().and_then(|metadata| {
-            let [source_node_id] = metadata.source_node_ids.as_slice() else {
-                return None;
-            };
-            Some(CalibrationGridBinding {
-                source_node_id: *source_node_id,
-                grid: CsiGridKey::from_bootstrap_grid(metadata.source_grid),
-                evidence: None,
-            })
+        // The receipt is the identity of the restored hold, so evidence a
+        // consumer reads after the restart matches the receipt it accepted
+        // before it.
+        calibration_model_receipt: restored_metadata.as_ref().map(|metadata| {
+            CalibrationModelReceipt {
+                schema: field_bridge::CALIBRATION_MODEL_RECEIPT_SCHEMA,
+                boot_epoch: metadata.identity.boot_epoch.clone(),
+                session_id: metadata.identity.session_id.clone(),
+                model_id: metadata.identity.model_id.clone(),
+                binding_digest: metadata.identity.binding_digest.clone(),
+                source_node_ids: metadata.identity.source_node_ids.clone(),
+                frame_count: metadata.identity.frame_count,
+                variance_explained: metadata.identity.variance_explained,
+                baseline_eigenvalue_count: metadata.identity.baseline_eigenvalue_count,
+                completed_at_unix_ms: metadata.identity.model_completed_at_unix_ms,
+            }
         }),
+        calibration_grid_binding: bootstrap_metadata
+            .as_ref()
+            .and_then(|metadata| {
+                let [source_node_id] = metadata.source_node_ids.as_slice() else {
+                    return None;
+                };
+                Some(CalibrationGridBinding {
+                    source_node_id: *source_node_id,
+                    grid: CsiGridKey::from_bootstrap_grid(metadata.source_grid),
+                    evidence: None,
+                })
+            })
+            .or_else(|| {
+                restored_metadata.as_ref().and_then(|metadata| {
+                    let [source_node_id] = metadata.identity.source_node_ids.as_slice() else {
+                        return None;
+                    };
+                    Some(CalibrationGridBinding {
+                        source_node_id: *source_node_id,
+                        grid: CsiGridKey::from_bootstrap_grid(metadata.identity.source_grid),
+                        evidence: None,
+                    })
+                })
+            }),
         calibration_last_sequences: HashMap::new(),
         calibration_reordered_packets: HashMap::new(),
         calibration_max_reorder_depth: HashMap::new(),
