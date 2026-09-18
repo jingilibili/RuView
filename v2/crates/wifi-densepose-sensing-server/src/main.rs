@@ -3206,6 +3206,8 @@ mod publication_ceiling_tests {
             breathing_phase_p95: breathing_p95,
             heartbeat_p50: heartbeat_p95 / 2.0,
             heartbeat_p95,
+            residual_breathing_p50: breathing_p95 / 2.0,
+            residual_breathing_p95: breathing_p95,
             samples: 5_000,
         }
     }
@@ -7281,6 +7283,12 @@ struct VitalsNullFloor {
     breathing_phase_p95: f64,
     heartbeat_p50: f64,
     heartbeat_p95: f64,
+    /// Same summary for the residual carrier, the feature the room B notebook
+    /// singles out as the one that responds to a body. MEASURED after the
+    /// 16:43 hold: its ratio read 2.14 to 2.93 while the other three features
+    /// sat inside their own ceilings.
+    residual_breathing_p50: f64,
+    residual_breathing_p95: f64,
 }
 
 /// Bounded so a long collection cannot grow without limit; the hold lasts
@@ -7314,6 +7322,7 @@ impl VitalsNullCollector {
     fn observe(&mut self, node_id: u8, evidence: SpectralEvidence) {
         if !evidence.breathing_peak_ratio.is_finite()
             || !evidence.heartbeat_peak_ratio.is_finite()
+            || !evidence.residual_breathing_peak_ratio.is_finite()
         {
             return;
         }
@@ -7341,9 +7350,15 @@ impl VitalsNullCollector {
                 .iter()
                 .map(|evidence| evidence.breathing_phase_peak_ratio)
                 .collect();
+            let mut residual_breathing: Vec<f64> = samples
+                .iter()
+                .map(|evidence| evidence.residual_breathing_peak_ratio)
+                .collect();
             let breathing_p50 = percentile_of(&mut breathing, 50).unwrap_or(0.0);
             let breathing_phase_p50 = percentile_of(&mut breathing_phase, 50).unwrap_or(0.0);
             let heartbeat_p50 = percentile_of(&mut heartbeat, 50).unwrap_or(0.0);
+            let residual_breathing_p50 =
+                percentile_of(&mut residual_breathing, 50).unwrap_or(0.0);
             out.insert(
                 *node_id,
                 VitalsNullFloor {
@@ -7360,6 +7375,12 @@ impl VitalsNullCollector {
                     heartbeat_p50,
                     heartbeat_p95: percentile_of(&mut heartbeat, VITALS_NULL_PERCENTILE)
                         .unwrap_or(0.0),
+                    residual_breathing_p50,
+                    residual_breathing_p95: percentile_of(
+                        &mut residual_breathing,
+                        VITALS_NULL_PERCENTILE,
+                    )
+                    .unwrap_or(0.0),
                 },
             );
         }
@@ -9861,6 +9882,8 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
                 "breathing_phase_p95_ratio": floor.breathing_phase_p95,
                 "heartbeat_p50_ratio": floor.heartbeat_p50,
                 "heartbeat_p95_ratio": floor.heartbeat_p95,
+                "residual_breathing_p50_ratio": floor.residual_breathing_p50,
+                "residual_breathing_p95_ratio": floor.residual_breathing_p95,
             })
         })
         .collect();
@@ -14155,6 +14178,13 @@ async fn main() {
                         breathing_phase_p95: floor.breathing_phase_p95,
                         heartbeat_p50: floor.heartbeat_p50,
                         heartbeat_p95: floor.heartbeat_p95,
+                        // The persisted image does not carry this feature's
+                        // ceiling yet; zero means "not measured", and the
+                        // publication gate treats an unmeasured ceiling as
+                        // nothing to clear. Persisting it follows once a hold
+                        // has produced the number.
+                        residual_breathing_p50: 0.0,
+                        residual_breathing_p95: 0.0,
                     },
                 )
             })
